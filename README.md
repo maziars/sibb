@@ -11,6 +11,33 @@ remains a moving target after release.
 
 ---
 
+## Examples
+
+Two real episodes — Gemini 2.5 Flash driving the iOS Simulator end-to-end.
+Each was captured at real-time playback (3 fps); verification reads ground
+truth directly from the underlying data store.
+
+<table>
+<tr>
+<td width="50%" align="center"><b>Complete a reminder</b></td>
+<td width="50%" align="center"><b>Create a calendar event</b></td>
+</tr>
+<tr>
+<td><img src="docs/media/complete_specific_reminder.gif" alt="agent completes a specific reminder" width="100%"/></td>
+<td><img src="docs/media/create_event_with_title_time.gif" alt="agent creates a calendar event" width="100%"/></td>
+</tr>
+<tr>
+<td><i>"Open Reminders. 'Update roadmap' is done — check it off."</i></td>
+<td><i>"Open Calendar. Create an event titled 'Date Night' tomorrow from 3pm to 3:45pm."</i></td>
+</tr>
+<tr>
+<td align="center"><sub>5 steps · verifier PASS (reads EventKit reminder store)</sub></td>
+<td align="center"><sub>16 steps · verifier PASS (reads EventKit calendar store)</sub></td>
+</tr>
+</table>
+
+---
+
 ## What's in the box
 
 - **72 task generators** across 11 system apps — Reminders, Calendar, Contacts,
