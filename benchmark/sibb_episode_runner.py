@@ -44,7 +44,11 @@ from sibb_verify_reminders import (
     verify_reminders_list_task,
     verify_reminders_list_task_async,
 )
-from sibb_state import apply_initial_state, apply_pre_runner_setup
+from sibb_state import (
+    apply_initial_state,
+    apply_pre_runner_setup,
+    is_pre_runner_entry,
+)
 
 # ── Terminal colours ─────────────────────────────────────────────────────────
 R  = "\033[0m";  B  = "\033[1m"
@@ -216,8 +220,10 @@ async def run_episode(reader: AXReader, task, idx: int, total: int, udid: str):
     # Apply task's per-episode state spec (Reminders state, start_page, …).
     # Note: any Springboard layout/dock entries needed sim shutdown and
     # must have been applied via apply_pre_runner_setup BEFORE reader
-    # started. The runner does that once at top-level for the whole
-    # task batch — see main(). apply_initial_state skips those entries.
+    # started. The runner does that per-task in main() via
+    # _prepare_task_pre_runner — every episode gets its own
+    # seed-determined randomization. apply_initial_state skips those
+    # entries.
     state_report = await apply_initial_state(reader._xcuitest, task)
     if state_report["applied"]:
         print(f"\n  {GY}state applied: {len(state_report['applied'])} entries{R}")
@@ -258,6 +264,64 @@ async def run_episode(reader: AXReader, task, idx: int, total: int, udid: str):
     return passed_before, passed_after
 
 
+def _task_has_pre_runner(task) -> bool:
+    """True iff this task's initial-state spec contains any entry that
+    requires the sim to be shut down (Springboard layout/dock)."""
+    spec = list(getattr(task.initial_state, "spec", None) or [])
+    return any(is_pre_runner_entry(e) for e in spec)
+
+
+async def _prepare_task_pre_runner(
+    udid: str,
+    task,
+    reader: Optional[AXReader],
+    task_idx: int,
+) -> AXReader:
+    """Apply the task's pre-runner setup (Springboard layout/dock) and
+    return a started reader.
+
+    Per-episode contract: EVERY task in the batch gets its own
+    seed-determined Springboard randomization applied. The previous
+    runner only did this for task #1 and inherited the layout for
+    later tasks — that broke the "every episode is independent"
+    invariant. See CLAUDE.md → Phase 2 → item #5.
+
+    If `reader` is already started AND the task has pre-runner entries
+    (which require the sim to be shut down), we stop the reader,
+    apply the pre-runner spec, and bring up a fresh reader. If the
+    task has no pre-runner entries, we keep the existing reader (or
+    start one on the first call).
+
+    Returns the (possibly new) reader. Caller owns it.
+    """
+    has_pre = _task_has_pre_runner(task)
+
+    if reader is not None and has_pre:
+        # Sim is about to be shut down; the reader's socket would
+        # die. Stop it cleanly first.
+        await reader.stop()
+        reader = None
+
+    if has_pre or reader is None:
+        # Apply the pre-runner spec. No-op (returns empty applied list)
+        # when has_pre is False — keeps the reporting consistent for
+        # the first-task path even when nothing needs shutting down.
+        pre_report = apply_pre_runner_setup(udid, task)
+        if pre_report["applied"]:
+            print(f"\n{B}Pre-runner setup (task {task_idx}):{R}")
+            for e in pre_report["applied"]:
+                print(f"  {e}")
+        if pre_report["errors"]:
+            for e in pre_report["errors"]:
+                print(f"  {RE}error: {e}{R}")
+
+    if reader is None:
+        reader = AXReader(udid)
+        await reader.start(bundle_id="com.apple.reminders")
+
+    return reader
+
+
 async def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -278,27 +342,17 @@ async def main():
     print(f"{B}Backend:{R} XCUITest persistent server (snapshot path)")
     print(f"{B}Verifier:{R} verify_reminders_list_task_async (EventKit)")
 
-    # Pre-runner setup: any Springboard layout/dock entries from the
-    # FIRST task in the batch are applied before the runner starts,
-    # because they require the sim to be shut down. Subsequent tasks in
-    # the same session share that layout (we don't tear down + restart
-    # the reader per episode). If per-episode layout randomization is
-    # needed, run the replay tool one task at a time instead.
-    if tasks:
-        pre_report = apply_pre_runner_setup(udid, tasks[0])
-        if pre_report["applied"]:
-            print(f"\n{B}Pre-runner setup (from task 1):{R}")
-            for e in pre_report["applied"]:
-                print(f"  {e}")
-        if pre_report["errors"]:
-            for e in pre_report["errors"]:
-                print(f"  {RE}error: {e}{R}")
-
-    reader = AXReader(udid)
-    await reader.start(bundle_id="com.apple.reminders")
+    # Per-episode pre-runner setup: EVERY task gets its own
+    # seed-determined Springboard layout/dock randomization. Tasks
+    # without pre-runner entries reuse the existing reader (no
+    # shutdown/boot cycle). Tasks WITH pre-runner entries pay the
+    # ~15s shutdown+apply+boot cost — but that's the price of an
+    # independent episode. See CLAUDE.md → Phase 2 → item #5.
+    reader: Optional[AXReader] = None
     try:
         results = []
         for i, task in enumerate(tasks, 1):
+            reader = await _prepare_task_pre_runner(udid, task, reader, i)
             before, after = await run_episode(reader, task, i, n, udid)
             results.append((task.task_id, before, after))
             if i < n:
@@ -312,7 +366,8 @@ async def main():
             icon = "✅" if (after and not before) else ("⚠" if after else "❌")
             print(f"  {icon}  {tid}: before={before} → after={after}")
     finally:
-        await reader.stop()
+        if reader is not None:
+            await reader.stop()
 
 
 if __name__ == "__main__":

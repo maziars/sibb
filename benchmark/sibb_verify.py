@@ -187,8 +187,46 @@ def _filter_calendar_events_baseline(records: List[Dict[str, Any]],
     return _filter_records(out, inner)
 
 
+def _filter_safari_bookmarks_baseline(
+        records: List[Dict[str, Any]],
+        selector: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Baseline-side analog of `_fetch_safari_bookmarks`. Consumes the
+    fetcher-only selector keys (`folder`, `include_subfolders`,
+    `include_reading_list`, `url_canonicalize`) so they don't fall
+    through into `_filter_records` and false-match against record
+    fields (the bookmark row has no `url_canonicalize` field, so a
+    plain exact-match selector would empty the baseline). The remaining
+    keys are exact-matched as usual.
+
+    `url_canonicalize=True` mirrors the fetcher: when set, both the
+    baseline row URLs AND any `url` selector key are canonicalized
+    BEFORE compare. This is what makes the identity check's
+    `exclude_match={"url": target_url}` post-filter work when Safari
+    saves a slightly-different URL form (trailing-slash etc.).
+    """
+    inner = dict(selector or {})
+    folder = inner.pop("folder", None)
+    inner.pop("include_subfolders", None)
+    inner.pop("include_reading_list", None)
+    canonicalize = bool(inner.pop("url_canonicalize", False))
+
+    out = records
+    if folder:
+        pf = folder.strip().lower()
+        out = [r for r in out
+                if pf in [(r.get("parent_title") or "").lower(),
+                          *[(p or "").lower() for p in
+                            (r.get("folder_path") or [])]]]
+    if canonicalize:
+        out = [dict(r, url=_canonicalize_url(r.get("url"))) for r in out]
+        if "url" in inner:
+            inner["url"] = _canonicalize_url(inner["url"])
+    return _filter_records(out, inner)
+
+
 _BASELINE_FILTERS = {
-    "calendar.events": _filter_calendar_events_baseline,
+    "calendar.events":  _filter_calendar_events_baseline,
+    "safari.bookmarks": _filter_safari_bookmarks_baseline,
 }
 
 
@@ -920,11 +958,16 @@ async def _fetch_mock_site_submissions(
             f"{site_id!r}. Call MockSite(site_id=...).start() in the "
             f"episode setup before invoking the verifier.")
 
-    rows = site.submissions()
+    # Decoy submissions (clicks on distractor buttons from
+    # `harness_layout.distractor_buttons`) are filtered by default so
+    # verifiers asserting "agent submitted the form" can't be fooled
+    # by a stray decoy click. Opt in via `include_decoys=True`.
+    include_decoys = bool(selector.get("include_decoys", False))
+    rows = site.submissions(include_decoys=include_decoys)
     if selector.get("latest"):
         rows = rows[-1:] if rows else []
     inner = {k: v for k, v in selector.items()
-              if k not in {"site_id", "latest"}}
+              if k not in {"site_id", "latest", "include_decoys"}}
     return _filter_records(rows, inner)
 
 
@@ -1951,13 +1994,26 @@ def _canonicalize_url(u: Any) -> Any:
     URL — string comparators downstream will fall back to plain compare.
 
     Idempotent: canonicalize twice → same result.
+
+    Non-authority schemes (mailto:, tel:, sms:, geo:, data:, file:)
+    are passed through unchanged — they have no host:port/path to
+    canonicalize, and prepending http:// would mis-rewrite them.
     """
     if not isinstance(u, str):
         return u
     s = u.strip()
     if not s:
         return u
-    # Add a scheme if missing so urlparse can split cleanly.
+    # Authority-based scheme like `http://...`. Anything else (single-
+    # colon mailto:, tel:, javascript: etc.) is not eligible for the
+    # host/path normalization we do here — pass through.
+    NON_AUTHORITY_SCHEMES = (
+        "mailto:", "tel:", "sms:", "geo:", "data:", "javascript:",
+    )
+    s_lower = s.lower()
+    for prefix in NON_AUTHORITY_SCHEMES:
+        if s_lower.startswith(prefix):
+            return u  # caller compares as-is
     has_scheme = re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", s) is not None
     if not has_scheme:
         if "/" in s or "." in s:
@@ -1981,10 +2037,12 @@ def _canonicalize_url(u: Any) -> Any:
     default_ports = {"http": 80, "https": 443}
     if p.port and p.port != default_ports.get(scheme):
         port = f":{p.port}"
-    # Trailing-slash on root paths is meaningful only for clarity —
-    # collapse "/" to "" for the host-only case; otherwise keep.
+    # Trailing slash policy: drop `/` only when there's nothing after
+    # it (bare-host URLs like `https://apple.com/` → `https://apple.com`).
+    # If a query or fragment follows, the `/` is the canonical separator
+    # — keep it. Same for explicit paths.
     path = p.path
-    if path == "/":
+    if path == "/" and not p.query and not p.fragment:
         path = ""
     netloc = host + port
     return urlunparse((scheme, netloc, path, p.params, p.query, p.fragment))

@@ -1,0 +1,407 @@
+# SIBB v1 — Option A+ task classification
+#
+# Each entry labels ONE generator from sibb/benchmark/sibb_task_generator_v3.py
+# under the C1 operational definition (see operational_definition.md):
+# "public, headers-published Apple SDKs, with first-launch authorization
+# prompts exempt."
+#
+# Three classes:
+#   - api_only:  cleanly solvable via the 11 tools in sibb_api_tools.py
+#   - ui_only:   no Apple-public-SDK call sequence mutates the verifier-checked
+#                state — agent scores 0% by construction
+#   - hybrid:    some sub-steps API-doable but the verifier cannot be satisfied
+#                without UI (enumerated for the second-rater pass; NOT included
+#                in the v1 headline run)
+#
+# Runner uses `class` and `api_tools` fields. Second-rater uses `class` +
+# `rationale` to compute Cohen's κ. `forum`, `framework`, `notes`, and
+# `c4_would_flip` are documentation only.
+#
+# `ui_verbs` is reserved (empty in v1) for the v2 Approach-C hybrid scaffold
+# so that re-classification under hybrid doesn't require schema changes.
+#
+# Total v1 scored slate: 29 tasks (22 api_only + 7 ui_only). Hybrid tasks are
+# enumerated for the second-rater pass but excluded from the headline run.
+
+version: 1
+generated_for_paper: SIBB v1 (ICLR + arXiv)
+operational_cut: C1
+seed: 0
+provider: gemini
+model: gemini-2.5-flash
+
+# Runner config moved to sibb_api_runner.py CLI flags; classification.yaml
+# remains a pure label artifact.
+
+# -----------------------------------------------------------------------------
+# api_only — agent SHOULD solve (22 tasks)
+# -----------------------------------------------------------------------------
+
+tasks:
+
+  # ---- Reminders (8) ---------------------------------------------------------
+
+  - generator: gen_add_reminder_to_existing_list
+    class: api_only
+    api_tools: [eventkit.list_reminders, eventkit.create_reminder]
+    ui_verbs: []
+    framework: EventKit (EKReminder)
+    rationale: >
+      EKReminder is a public class with a public `save(_:commit:)` path on
+      EKEventStore. Adding to an existing list maps to a single
+      eventkit.create_reminder call after eventkit.list_reminders confirms
+      list existence. Verifier matches on (list, title) — no UI required.
+
+  - generator: gen_create_recurring_with_due
+    class: api_only
+    api_tools: [eventkit.create_reminder]
+    ui_verbs: []
+    framework: EventKit (EKReminder + EKRecurrenceRule)
+    rationale: >
+      Single call: create reminder with `recurrenceRules: [...]` and `dueDate`
+      both set. EKReminder.dueDateComponents is public.
+
+  - generator: gen_list_due_today
+    class: api_only
+    api_tools: [eventkit.list_reminders, agent.answer]
+    ui_verbs: []
+    framework: EventKit (predicateForReminders)
+    rationale: >
+      `predicateForIncompleteReminders(withDueDateStarting:ending:)` is a
+      public EKEventStore method. Agent filters list_reminders output by due
+      date and submits the count/titles via agent.answer.
+
+  - generator: gen_list_due_tomorrow
+    class: api_only
+    api_tools: [eventkit.list_reminders, agent.answer]
+    ui_verbs: []
+    framework: EventKit (same as above)
+    rationale: >
+      Identical to gen_list_due_today with a date offset. Pure read.
+
+  - generator: gen_lookup_reminder_notes
+    class: api_only
+    api_tools: [eventkit.list_reminders, agent.answer]
+    ui_verbs: []
+    framework: EventKit (EKReminder.notes)
+    rationale: >
+      Pure read of EKReminder.notes for a named reminder. agent.answer carries
+      the notes string.
+
+  # ---- Calendar (6) ----------------------------------------------------------
+
+  - generator: gen_create_event_with_title_time
+    class: api_only
+    api_tools: [eventkit.list_calendars, eventkit.create_event]
+    ui_verbs: []
+    framework: EventKit (EKEvent)
+    rationale: >
+      EKEvent has public R/W title, startDate, endDate, calendar. One
+      create_event call after looking up the calendar. The verifier's
+      `count == 1` global guard expects the writable calendar to be empty
+      at baseline — confirmed by the generator's empty `_calendar_spec([])`.
+
+  - generator: gen_create_recurring_event
+    class: api_only
+    api_tools: [eventkit.list_calendars, eventkit.create_event]
+    ui_verbs: []
+    framework: EventKit (EKEvent + EKRecurrenceRule)
+    rationale: >
+      EKEvent.recurrenceRules is public. Single create_event call. Writable
+      calendar empty at baseline.
+
+  - generator: gen_lookup_event_location
+    class: api_only
+    api_tools: [eventkit.list_events, agent.answer]
+    ui_verbs: []
+    framework: EventKit (EKEvent.location)
+    rationale: >
+      EKEvent.location is a public String. Pure read.
+
+  - generator: gen_list_events_today
+    class: api_only
+    api_tools: [eventkit.list_events, agent.answer]
+    ui_verbs: []
+    framework: EventKit (predicateForEvents)
+    rationale: >
+      `predicateForEvents(withStart:end:calendars:)` is public. Pure read.
+
+  - generator: gen_list_conflicting_events
+    class: api_only
+    api_tools: [eventkit.list_events, agent.answer]
+    ui_verbs: []
+    framework: EventKit
+    rationale: >
+      Pure read + interval overlap computation in the agent. agent.answer
+      carries the conflict pair(s).
+
+  - generator: gen_next_event_lookup
+    class: api_only
+    api_tools: [eventkit.list_events, agent.answer]
+    ui_verbs: []
+    framework: EventKit
+    rationale: >
+      Pure read; agent picks the soonest event whose start > now and answers.
+
+  # ---- Contacts (6) ----------------------------------------------------------
+
+  - generator: gen_create_contact_with_address
+    class: api_only
+    api_tools: [cn.create_contact]
+    ui_verbs: []
+    framework: Contacts (CNMutableContact + CNPostalAddress)
+    rationale: >
+      CNMutableContact has public R/W givenName / familyName / postalAddresses.
+      Single create_contact call.
+
+  - generator: gen_full_business_card
+    class: api_only
+    api_tools: [cn.create_contact]
+    ui_verbs: []
+    framework: Contacts
+    rationale: >
+      All v1 fields (name, org, phone, email, address) are public R/W on
+      CNMutableContact. Single create_contact call.
+
+  - generator: gen_lookup_phone_by_name
+    class: api_only
+    api_tools: [cn.list_contacts, agent.answer]
+    ui_verbs: []
+    framework: Contacts (CNContactStore.unifiedContacts)
+    rationale: >
+      CNPhoneNumber via CNLabeledValue is public. Pure read + answer.
+
+  - generator: gen_set_contact_birthday
+    class: api_only
+    api_tools: [cn.list_contacts, cn.update_contact]
+    ui_verbs: []
+    framework: Contacts (CNContact.birthday)
+    rationale: >
+      CNContact.birthday is a public DateComponents R/W field. Direct
+      update_contact call (no list+wipe+create workaround needed — Swift HAS
+      update_contact, unlike events / reminders).
+
+  - generator: gen_set_contact_birthday_no_year
+    class: api_only
+    api_tools: [cn.list_contacts, cn.update_contact]
+    ui_verbs: []
+    framework: Contacts (CNContact.birthday with year omitted)
+    rationale: >
+      Same as gen_set_contact_birthday but with `--MM-DD` sentinel for
+      year-omitted (DateComponents with year=nil). CNContact.birthday is a
+      public DateComponents field; the year-omitted case is the iOS
+      Contacts.app default and is well-formed in CNContact.
+
+  - generator: gen_add_second_phone_label
+    class: api_only
+    api_tools: [cn.list_contacts, cn.update_contact]
+    ui_verbs: []
+    framework: Contacts (CNLabeledValue<CNPhoneNumber>)
+    rationale: >
+      CNLabeledValue with public label constants (CNLabelHome, etc.).
+      update_contact appends the new labeled phone.
+
+  # ---- Cross-app (2) ---------------------------------------------------------
+
+  - generator: gen_maps_search_to_contact
+    class: api_only
+    api_tools: [mklocalsearch.query, cn.list_contacts, cn.update_contact]
+    ui_verbs: []
+    framework: MapKit (MKLocalSearch) + Contacts
+    rationale: >
+      MKLocalSearch.start() is public and returns MKMapItem with
+      placemark.postalAddress (CNPostalAddress). MKLocalSearch confirmed
+      working on iOS 26.3 simulator for the `_LESSER_KNOWN_PLACES` corpus
+      (see memory/sibb_maps_search_to_contact_robustness.md). No UI required
+      for either half — search resolves the address; update_contact attaches
+      it. Verifier checks only city + label, not street.
+
+  - generator: gen_reminder_with_calendar_event
+    class: api_only
+    api_tools: [eventkit.create_event, eventkit.create_reminder]
+    ui_verbs: []
+    framework: EventKit
+    rationale: >
+      Two independent creates on the same EKEventStore. Cross-app composition
+      with no UI dependency. Verifier is 3 `exists` checks; no count guards
+      on either app.
+
+  # ---- UI-required (7) — 0% by construction ---------------------------------
+
+  - generator: gen_message_save_sender
+    class: ui_only
+    api_tools: []
+    ui_verbs: []
+    framework: (none)
+    forum: https://developer.apple.com/forums/thread/42310
+    c4_would_flip: false
+    rationale: >
+      No public iOS framework reads inbound iMessage bodies. CKMessage /
+      IMHandle classes are private. Messages Extensions can READ a draft being
+      composed, not inbound history. ILMessageFilterExtension surfaces an
+      unread SMS to a separate filter process before delivery but does NOT
+      expose ongoing access from a third-party agent app context after
+      delivery completes. The agent has no API path to extract the sender's
+      name or phone from a received iMessage.
+
+  - generator: gen_message_save_body
+    class: ui_only
+    api_tools: []
+    ui_verbs: []
+    framework: (none)
+    forum: https://developer.apple.com/forums/thread/42310
+    c4_would_flip: false
+    rationale: >
+      Same platform constraint as gen_message_save_sender. Body extraction
+      from inbound iMessage has no public API.
+
+  - generator: gen_message_save_address
+    class: ui_only
+    api_tools: []
+    ui_verbs: []
+    framework: (none)
+    forum: https://developer.apple.com/forums/thread/42310
+    c4_would_flip: false
+    rationale: >
+      Same as above — inbound message body is unreadable. Even if the agent
+      had the body string, address-extraction would still need the read step.
+
+  - generator: gen_message_save_sender_with_address
+    class: ui_only
+    api_tools: []
+    ui_verbs: []
+    framework: (none)
+    forum: https://developer.apple.com/forums/thread/42310
+    c4_would_flip: false
+    rationale: >
+      Combined sender + body read. Both halves UI-required.
+
+  - generator: gen_message_to_contact_to_maps
+    class: ui_only
+    api_tools: []
+    ui_verbs: []
+    framework: (none — for the inbound message read step)
+    forum: https://developer.apple.com/forums/thread/724907
+    c4_would_flip: false
+    caveat: >
+      The Maps activation step is itself contested. MKDirections.calculate()
+      can produce an MKRoute programmatically, and writing to the rstorage
+      active-route blob is what the Phase A++ verifier reads (see
+      memory/sibb_maps_verifier_phase_a_plus_plus.md). A reviewer could
+      argue that an API path exists for the Maps half. BUT the message-read
+      half is still UI-required (no inbound iMessage API), which gates the
+      task. Probe TODO: run an MKDirections-only sim experiment to confirm
+      whether the rstorage active-route blob is writable from a third-party
+      app context outside Maps.app.
+    rationale: >
+      Two UI-required hops compose: (a) reading the inbound message to
+      extract the recipient name (no public API — Forum 42310); (b) activating
+      Maps turn-by-turn nav (MKMapItem.openInMaps opens Maps but does not
+      auto-start nav — Forum 724907). The message-read half is the binding
+      constraint regardless of whether the Maps half might have an API path.
+
+  - generator: gen_message_to_new_contact_to_maps
+    class: ui_only
+    api_tools: []
+    ui_verbs: []
+    framework: (none)
+    forum: https://developer.apple.com/forums/thread/724907
+    c4_would_flip: false
+    caveat: >
+      Same MKDirections caveat as gen_message_to_contact_to_maps.
+    rationale: >
+      Same as gen_message_to_contact_to_maps. Cross-app (Messages →
+      Contacts → Maps) where the message-read hop has no API path.
+
+  - generator: gen_safari_bookmark_specific_url
+    class: ui_only
+    api_tools: []
+    ui_verbs: []
+    framework: (none)
+    c4_would_flip: false
+    rationale: >
+      Safari bookmarks have no public iOS CRUD API outside of Safari Extension
+      contexts (and Safari Extensions on iOS don't expose bookmark mutation
+      from a third-party app context). `WKWebView` is not Safari and has no
+      shared bookmark store. A productized third-party agent has no path to
+      mutate MobileSafari's bookmark database.
+
+# -----------------------------------------------------------------------------
+# hybrid — enumerated for second-rater Cohen's κ; NOT scored in v1 run
+# -----------------------------------------------------------------------------
+
+hybrid_tasks_for_kappa:
+
+  - generator: gen_change_event_title
+    class: hybrid
+    rationale: >
+      EKEvent.title is a public setter and EventKit has `save(_:span:commit:)`,
+      so the platform CAN update the title. The Swift wrapper in SIBBServer
+      lacks an update_event command. Under C1 the platform supports it
+      (`api_only` under that reading); under the stricter "tools we expose"
+      reading the API agent cannot reach it cleanly. Listed as hybrid to
+      surface the operational-cut ambiguity to the second-rater.
+
+  - generator: gen_set_event_location
+    class: hybrid
+    rationale: >
+      Same shape as gen_change_event_title — EKEvent.location is a public
+      setter; no wrapper. Hybrid under our cut, api_only under broader cut.
+
+  - generator: gen_make_reminder_recurring
+    class: hybrid
+    rationale: >
+      EKReminder.recurrenceRules is a public R/W property, so the platform
+      supports update. The Swift wrapper has no `update_reminder` handler,
+      and the Python list+wipe+create workaround in sibb_api_tools.py
+      currently raises NotImplementedError (per operational_definition.md
+      §3.bis — the workaround requires a per-item Swift delete handler we
+      have not built). Moved from api_only to hybrid for v1 so the system
+      prompt does not promise a path the dispatcher cannot fulfill.
+
+  - generator: gen_set_priority
+    class: hybrid
+    rationale: >
+      Same wrapper-gap as gen_make_reminder_recurring. EKReminder.priority
+      is public R/W; no Swift update handler; Python workaround gated.
+
+  - generator: gen_add_notes_to_reminder
+    class: hybrid
+    rationale: >
+      Same wrapper-gap. EKCalendarItem.notes is public R/W; no update
+      handler; workaround gated.
+
+# -----------------------------------------------------------------------------
+# Coverage summary
+# -----------------------------------------------------------------------------
+
+summary:
+  api_only: 19
+  ui_only: 7
+  hybrid_for_kappa: 5
+  total_scored: 26
+  total_for_kappa: 31
+  notes: >
+    Three legacy generators were dropped from an earlier draft because they
+    emit no `verify_checks` and are structurally inert in the v1 runner
+    pipeline (CLARIFY was intentionally dropped — see CLAUDE.md):
+      - gen_partial_feasibility_blocking (was ui_only)
+      - gen_ambiguous_contact_missing_phone (was ui_only)
+      - gen_update_contact_phone (was api_only)
+    Replaced gen_update_contact_phone with gen_set_contact_birthday_no_year
+    to keep Contacts at 6 entries. The two ui_only drops were not replaced;
+    ui_only dropped from 8 to 7. The gen_safari_bookmark_specific_url entry
+    was moved from the hybrid section to the ui_only headline slate (its
+    label was ui_only all along).
+
+    Bucket-1 reclassification (10-critic panel): three Reminders tasks
+    that rely on the list+wipe+create workaround
+    (gen_make_reminder_recurring, gen_set_priority,
+    gen_add_notes_to_reminder) moved from api_only to
+    hybrid_tasks_for_kappa. The dispatcher's synthetic_update_reminder
+    helper currently raises NotImplementedError (operational_definition.md
+    §3.bis) because it requires a per-item Swift delete handler we have
+    not built. Until that lands, the system prompt cannot honestly
+    promise the workaround works; the cleanest fix for v1 is to score
+    these tasks as `hybrid` (same shape as gen_change_event_title /
+    gen_set_event_location). Headline n dropped from 29 to 26.

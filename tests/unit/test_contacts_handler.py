@@ -81,15 +81,33 @@ def test_contact_minimal_construction_with_family_name():
 
 
 def test_contact_to_dict_canonical_shape():
+    """The Contact dataclass has grown over time (added v1 fields
+    like nickname, postal_addresses, etc.). This test pins:
+      * The 5 explicitly-set fields appear with their values.
+      * Every None-default field is preserved as None (so handlers
+        can round-trip through dict-form without losing the slot).
+      * The app + type discriminators are stable.
+    """
     c = Contact(given_name="Ada", family_name="Lovelace",
                  phone="+1-555-0100", email="ada@example.com",
                  organization="Analytical Engine Co.")
-    assert c.to_dict() == {
-        "app": "Contacts", "type": "contact",
-        "given_name": "Ada", "family_name": "Lovelace",
-        "phone": "+1-555-0100", "email": "ada@example.com",
-        "organization": "Analytical Engine Co.",
-    }
+    d = c.to_dict()
+    # Stable discriminators + explicitly-set values.
+    assert d["app"] == "Contacts"
+    assert d["type"] == "contact"
+    assert d["given_name"] == "Ada"
+    assert d["family_name"] == "Lovelace"
+    assert d["phone"] == "+1-555-0100"
+    assert d["email"] == "ada@example.com"
+    assert d["organization"] == "Analytical Engine Co."
+    # Every other dataclass field must appear (as None) so round-trip
+    # via `from_dict` is loss-less. Sample a few representative ones.
+    for none_field in ("middle_name", "nickname", "job_title",
+                        "department", "birthday", "phones", "emails",
+                        "postal_addresses", "urls", "dates"):
+        assert none_field in d, f"missing field {none_field}"
+        assert d[none_field] is None, (
+            f"{none_field} should be None when unset; got {d[none_field]!r}")
 
 
 def test_contact_round_trip():

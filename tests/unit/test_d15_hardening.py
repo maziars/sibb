@@ -84,16 +84,31 @@ async def test_ensure_runner_permissions_calls_simctl_per_service():
                     return_value=["reminders", "calendar"]):
             await xcc.ensure_runner_permissions("FAKE-UDID")
 
-    # One simctl invocation per service. Each must include both
-    # "privacy" and "grant" plus the right service + bundle.
-    assert len(spawned) == 2
+    # One simctl invocation per service that the runner needs, PLUS
+    # one unconditional `location → com.apple.Maps` grant added at
+    # the end of `ensure_runner_permissions` so Maps' directions flow
+    # doesn't hit the "Location Services is Off" prompt (added
+    # 2026-05-27 for Phase 3 messaging variant D). So with 2 mocked
+    # services we expect exactly 3 spawns total.
+    assert len(spawned) == 3
+    runner_grants = [a for a in spawned
+                      if "com.sibb.tests.xctrunner" in " ".join(map(str, a))]
+    maps_grants = [a for a in spawned
+                    if "com.apple.Maps" in " ".join(map(str, a))]
+    assert len(runner_grants) == 2, (
+        "expected one runner-bundle grant per mocked service "
+        "(reminders + calendar)")
+    assert len(maps_grants) == 1, (
+        "expected the unconditional location → com.apple.Maps grant")
     for call_args in spawned:
         flat = " ".join(str(a) for a in call_args)
         assert "simctl" in flat
         assert "privacy" in flat
         assert "grant" in flat
         assert "FAKE-UDID" in flat
-        assert "com.sibb.tests.xctrunner" in flat
+    # Verify the Maps grant targets `location`.
+    maps_flat = " ".join(str(a) for a in maps_grants[0])
+    assert "location" in maps_flat
 
 
 # ──────────────── #9 process-group cleanup ──────────────────────────

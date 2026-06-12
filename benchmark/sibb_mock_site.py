@@ -114,6 +114,7 @@ class MockSite:
         sign_up_path: str = "/signup",
         dashboard_path: str = "/dashboard",
         status_path: str = "/status",
+        static_pages: Optional[Dict[str, Any]] = None,
     ):
         self.site_id = site_id
         # Bind explicitly to 127.0.0.1 rather than "localhost" to
@@ -125,11 +126,37 @@ class MockSite:
         self.sign_up_path = sign_up_path
         self.dashboard_path = dashboard_path
         self.status_path = status_path
+        # Static-page templates for Phase 4+ harness generators
+        # (event detail, recipe, business card, multi-step checkout
+        # etc.). Each value is either:
+        #   - a `str` of fully-rendered HTML (served verbatim), or
+        #   - a `Callable[[random.Random], str]` invoked PER REQUEST
+        #     with a per-page-seeded RNG, so layouts can randomize
+        #     (button position, distractor buttons, page length,
+        #     form-field order) without breaking determinism. The
+        #     page seed derives from MockSite.page_seed XOR the
+        #     hash of the path, so the same path always returns the
+        #     same rendered HTML within an episode.
+        #
+        # POSTs to ANY path land in `_submissions` (no need to declare
+        # form-target paths up front). GETs to static-page paths
+        # land in `_visits` the same way signin/signup do.
+        self.static_pages: Dict[str, Any] = dict(static_pages or {})
+        # Per-episode page seed (set at construction time so seeded
+        # pages are stable for the duration of the episode but
+        # vary across episodes / generator seeds).
+        self.page_seed: int = 0
 
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._submissions: List[Dict[str, Any]] = []
         self._visits: List[Dict[str, Any]] = []
+        # Full HTTP request log — every GET and POST regardless of
+        # status code. Used by episode debugging: when a verifier
+        # fails because the agent's submission didn't land, this log
+        # tells us whether the agent's tap actually fired a POST or
+        # whether iOS routed the tap somewhere else.
+        self._request_log: List[Dict[str, Any]] = []
         self._sessions: set = set()
         self._lock = threading.Lock()
 
@@ -183,13 +210,36 @@ class MockSite:
     def signup_url(self) -> str:
         return f"{self.base_url}{self.sign_up_path}"
 
-    def submissions(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return [dict(s) for s in self._submissions]
+    def submissions(self, *,
+                     include_decoys: bool = False
+                     ) -> List[Dict[str, Any]]:
+        """Return all recorded form submissions.
 
-    def last_submission(self) -> Optional[Dict[str, Any]]:
+        By default DECOY submissions (clicks on distractor buttons
+        from `harness_layout.distractor_buttons`) are filtered out
+        so verifiers asserting "the agent submitted exactly one form"
+        aren't fooled by a stray test-tap on a decoy. Pass
+        `include_decoys=True` to see them.
+        """
         with self._lock:
-            return dict(self._submissions[-1]) if self._submissions else None
+            rows = [dict(s) for s in self._submissions]
+        if not include_decoys:
+            rows = [s for s in rows if not s.get("is_decoy")]
+        return rows
+
+    def last_submission(self, *,
+                         include_decoys: bool = False
+                         ) -> Optional[Dict[str, Any]]:
+        rows = self.submissions(include_decoys=include_decoys)
+        return rows[-1] if rows else None
+
+    def request_log(self) -> List[Dict[str, Any]]:
+        """Full HTTP request log. Each entry has `method`, `path`,
+        `query`, `content_length`, `content_type`, `response_code`,
+        `epoch`, `user_agent`. Use for episode debugging — answers
+        "did the agent's tap actually fire a POST?"."""
+        with self._lock:
+            return [dict(r) for r in self._request_log]
 
     def visits(self) -> List[Dict[str, Any]]:
         """List every GET that hit this site. Each entry has `path`,
@@ -219,6 +269,7 @@ class MockSite:
         with self._lock:
             self._submissions.clear()
             self._visits.clear()
+            self._request_log.clear()
             self._sessions.clear()
 
     # ─────────────────────────── handler factory ──────────────────────
@@ -231,6 +282,45 @@ class MockSite:
             # already capture submissions structurally.
             def log_message(self, *a, **kw):  # noqa: D401
                 return
+
+            def log_request(self, code="-", size="-"):
+                """Called by BaseHTTPRequestHandler after every
+                completed request. We hijack this to append to the
+                full request log — captures method/path/code uniformly
+                for GETs and POSTs without touching each handler.
+                """
+                path_and_query = getattr(self, "path", "")
+                path = path_and_query.split("?", 1)[0]
+                query = (path_and_query.split("?", 1)[1]
+                          if "?" in path_and_query else "")
+                try:
+                    code_int = int(code)
+                except (TypeError, ValueError):
+                    code_int = 0
+                # `self.headers` is None until the request line + header
+                # block parse cleanly. `send_error` on a malformed
+                # request can call `log_request` before that — guard
+                # with a getattr.
+                headers = getattr(self, "headers", None)
+
+                def _hdr(name: str) -> str:
+                    if headers is None:
+                        return ""
+                    try:
+                        return headers.get(name) or ""
+                    except Exception:
+                        return ""
+                with site._lock:
+                    site._request_log.append({
+                        "method": getattr(self, "command", ""),
+                        "path": path,
+                        "query": query,
+                        "content_length": _hdr("Content-Length"),
+                        "content_type": _hdr("Content-Type"),
+                        "response_code": code_int,
+                        "user_agent": _hdr("User-Agent"),
+                        "epoch": time.time(),
+                    })
 
             def do_GET(self):
                 path_and_query = self.path
@@ -249,6 +339,37 @@ class MockSite:
                             "user_agent": self.headers.get(
                                 "User-Agent", ""),
                         })
+                # Static-page templates take precedence over the
+                # built-in routes (so a generator can override `/` with
+                # a custom landing page if needed).
+                if path in site.static_pages:
+                    self._serve_static_page(path, query)
+                    return
+                # Step 5M (2026-06-08) — prefix-routed static_pages.
+                # If a registered key ends in "/", treat it as a prefix
+                # that matches any path starting with it (e.g. key
+                # "/product/" matches "/product/wm-1546"). The TEMPLATE
+                # gets the full request path via the `path` kwarg so it
+                # can dispatch on the tail. Used by shop generators to
+                # serve N product detail pages from one template.
+                #
+                # Exclude bare "/" — every absolute path starts with it,
+                # so using it as a prefix would catch all unmatched
+                # requests. The root is reserved for exact matching.
+                # Longest-prefix-wins (so `/account/cards/` beats
+                # `/account/`) to keep nested routes deterministic.
+                prefix_match = None
+                for key in site.static_pages:
+                    if key == "/" or not key.endswith("/"):
+                        continue
+                    if path.startswith(key) and (
+                            prefix_match is None
+                            or len(key) > len(prefix_match)):
+                        prefix_match = key
+                if prefix_match is not None:
+                    self._serve_static_page(
+                        prefix_match, query, full_path=path)
+                    return
                 if path == site.sign_in_path or path == "/":
                     self._serve_form(mode="signin")
                 elif path == site.sign_up_path:
@@ -261,13 +382,20 @@ class MockSite:
                     self.send_error(404)
 
             def do_POST(self):
-                path = self.path.split("?", 1)[0]
+                path_and_query = self.path
+                path = path_and_query.split("?", 1)[0]
                 if path == site.sign_in_path:
                     self._handle_credential_post(create=False)
                 elif path == site.sign_up_path:
                     self._handle_credential_post(create=True)
                 else:
-                    self.send_error(404)
+                    # Capture POSTs to any other path as a generic
+                    # submission. Generators can submit forms to
+                    # arbitrary endpoints (`/rsvp`, `/buy`, etc.)
+                    # without declaring them up front; the verifier
+                    # reads them via `mock_site.submissions` with
+                    # `path` in the selector.
+                    self._handle_generic_post(path)
 
             # ─────────────── responses ───────────────
 
@@ -309,9 +437,16 @@ class MockSite:
                 self._send_html(200, html)
 
             def _handle_credential_post(self, create: bool) -> None:
-                length = int(self.headers.get("Content-Length") or 0)
+                MAX_BODY = 1 << 20
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    length = 0
+                length = max(0, min(length, MAX_BODY))
                 raw = self.rfile.read(length) if length > 0 else b""
-                fields = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+                fields = urllib.parse.parse_qs(
+                    raw.decode("utf-8", "replace"),
+                    keep_blank_values=True)
                 username = (fields.get("username") or [""])[0]
                 password = (fields.get("password") or [""])[0]
 
@@ -335,9 +470,12 @@ class MockSite:
 
                     site._submissions.append({
                         "mode": "signup" if create else "signin",
+                        "path": (site.sign_up_path if create
+                                  else site.sign_in_path),
                         "username": username,
                         "password": password,
                         "success": success,
+                        "is_decoy": False,
                         "timestamp": time.time(),
                     })
 
@@ -405,6 +543,212 @@ class MockSite:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _serve_static_page(self, registered_path: str,
+                                    query: str = "",
+                                    *,
+                                    full_path: Optional[str] = None) -> None:
+                """Render a static-page template and serve it.
+
+                Templates are either strings (verbatim HTML) or
+                callables that take a per-path `random.Random` and
+                return HTML. The per-path RNG is seeded deterministically
+                so the same path always renders the same layout within
+                an episode (replayable), but different paths (or a
+                different MockSite.page_seed across episodes) produce
+                different layouts.
+
+                Step 5M (2026-06-08) — templates may OPT IN to extra
+                request context by declaring `path` and/or `query`
+                keyword parameters. The MockSite uses `inspect` to
+                pass them only if the signature accepts them, so
+                pre-existing single-arg templates (`rsvp_event` etc.)
+                are unaffected. New shop templates use this to serve
+                N product detail pages from one prefix-routed template
+                (key `/product/` matches `/product/<sku_id>`; the
+                template reads the tail from the `path` kwarg).
+                """
+                tpl = site.static_pages.get(registered_path)
+                if tpl is None:
+                    self.send_error(404)
+                    return
+                # Effective path for RNG seeding + the kwarg passed to
+                # the template — the full request path (so each
+                # `/product/<sku_id>` gets its own RNG and the template
+                # can extract <sku_id>) rather than the registered key.
+                effective_path = full_path or registered_path
+                import html as _html
+                if callable(tpl):
+                    import random as _random
+                    import inspect as _inspect
+                    # Stable per-path seed: episode seed XOR a stable
+                    # 32-bit digest of the path. Each path gets its
+                    # own RNG. The same helper is exposed publicly so
+                    # generators can re-derive the SAME RNG to know
+                    # what choices the template will make.
+                    from harness_layout import compute_path_seed
+                    path_seed = compute_path_seed(
+                        site.page_seed, effective_path)
+                    rng = _random.Random(path_seed)
+                    # Opt-in: pass `path` / `query` kwargs only when
+                    # the template's signature names them. Keeps the
+                    # existing `(rng)`-only convention working.
+                    try:
+                        sig = _inspect.signature(tpl)
+                        extra = {}
+                        if "path" in sig.parameters:
+                            extra["path"] = effective_path
+                        if "query" in sig.parameters:
+                            extra["query"] = query
+                        if "page_seed" in sig.parameters:
+                            # Step 5O (2026-06-09) — templates needing
+                            # cross-path task-level state (e.g. V4 shop
+                            # /product/, /checkout, /account/cards all
+                            # branching on the same `use_saved_cards`
+                            # bool) opt in to the episode's page_seed
+                            # and derive the helper's RNG from a fixed
+                            # reference path.
+                            extra["page_seed"] = site.page_seed
+                    except (TypeError, ValueError):
+                        extra = {}
+                    try:
+                        html = tpl(rng, **extra)
+                    except Exception as e:
+                        self._send_html(
+                            500,
+                            f"<!DOCTYPE html><html><body>\n"
+                            f"<h1>Template error</h1>\n"
+                            f"<pre>{_html.escape(repr(e))}</pre>"
+                            f"</body></html>\n")
+                        return
+                    # Templates MUST return a str. Coroutines, None,
+                    # bytes, and other types are author bugs — surface
+                    # them as a 500 with a clear message so generators
+                    # get an actionable signal instead of an opaque
+                    # `bytes has no attribute encode` later.
+                    if not isinstance(html, str):
+                        type_name = type(html).__name__
+                        self._send_html(
+                            500,
+                            f"<!DOCTYPE html><html><body>\n"
+                            f"<h1>Template type error</h1>\n"
+                            f"<p>Template for "
+                            f"<code>{_html.escape(effective_path)}</code> "
+                            f"returned a "
+                            f"<code>{_html.escape(type_name)}</code>; "
+                            f"expected <code>str</code>.</p>\n"
+                            f"</body></html>\n")
+                        return
+                else:
+                    html = str(tpl)
+                self._send_html(200, html)
+
+            def _handle_generic_post(self, path: str) -> None:
+                """Capture a POST to a non-credential path. Form fields
+                land in `_submissions` under a path-discriminated entry
+                so verifiers can scope by both `mode` (=path) AND
+                fields. Returns a small acknowledgement page so the
+                agent's UI flow has somewhere to land.
+
+                Generators can use this for `/rsvp`, `/buy`, `/contact`
+                etc. without declaring those paths up front. The
+                verifier reads via `mock_site.submissions` with
+                `mode=<path>` in the selector.
+                """
+                # Cap body size at 1 MiB. A malformed or adversarial
+                # Content-Length larger than this is silently truncated
+                # — prevents `read()` from hanging on the wire forever
+                # waiting for bytes that never come, and bounds memory
+                # for any one request.
+                MAX_BODY = 1 << 20
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    length = 0
+                length = max(0, min(length, MAX_BODY))
+                raw = self.rfile.read(length) if length > 0 else b""
+                content_type = (
+                    self.headers.get("Content-Type") or "").lower()
+                parse_error: Optional[str] = None
+                if content_type.startswith("multipart/"):
+                    # We don't parse multipart bodies. Record the marker
+                    # so verifier authors don't false-pass on "no fields
+                    # submitted" when the form was actually a multipart
+                    # upload.
+                    fields_qs = {}
+                    parse_error = "multipart_unsupported"
+                else:
+                    # keep_blank_values=True so a deliberately-empty
+                    # field (`email=`) gets recorded as `email=""` —
+                    # otherwise verifiers can't distinguish "agent
+                    # didn't fill the field" from "field absent from
+                    # form".
+                    fields_qs = urllib.parse.parse_qs(
+                        raw.decode("utf-8", "replace"),
+                        keep_blank_values=True)
+                # parse_qs returns each value as a list; flatten to the
+                # first value (the typical case for HTML forms) but
+                # keep the list-form in `fields_raw` for radio/checkbox
+                # groups where multiple values are legitimate.
+                fields_flat = {
+                    k: (v[0] if len(v) == 1 else v)
+                    for k, v in fields_qs.items()
+                }
+                # Lazy-import so test fixtures don't pay the cost.
+                try:
+                    from harness_layout import DECOY_PATH as _DECOY
+                except Exception:
+                    _DECOY = "/__sibb_decoy__"
+                is_decoy = (path == _DECOY)
+                entry: Dict[str, Any] = {
+                    # `mode` is the legacy key carrying signin/signup
+                    # for credential submissions; for static-page POSTs
+                    # we put the path here too (same value as `path`)
+                    # for backwards-compat. New code should select on
+                    # `path` directly.
+                    "mode": path,
+                    "path": path,
+                    "fields": fields_flat,
+                    "fields_raw": fields_qs,
+                    "is_decoy": is_decoy,
+                    "timestamp": time.time(),
+                }
+                if parse_error:
+                    entry["parse_error"] = parse_error
+                    entry["content_type"] = content_type
+                with site._lock:
+                    site._submissions.append(entry)
+                import html as _html
+                # Echo back what the server received so the agent can
+                # see concrete evidence of which field values landed —
+                # turns a vague "did it work?" into "yes, here's what
+                # you submitted". `role="status"` marks the confirmation
+                # as a live region so it surfaces clearly in the iOS
+                # AX tree (Safari maps `role="status"` to an
+                # `XCUIElementTypeStaticText` with the live-region
+                # role hint).
+                rows = []
+                for k, v in fields_flat.items():
+                    if isinstance(v, list):
+                        v_str = ", ".join(str(x) for x in v)
+                    else:
+                        v_str = str(v)
+                    rows.append(
+                        f"  <dt>{_html.escape(k)}</dt>"
+                        f"<dd>{_html.escape(v_str) or '(empty)'}</dd>")
+                rows_html = "\n".join(rows) if rows else (
+                    "  <dt>(no fields)</dt><dd>—</dd>")
+                self._send_html(
+                    200,
+                    "<!DOCTYPE html>\n<html><head>"
+                    "<title>Submission received</title>"
+                    "</head>\n<body>\n"
+                    "<main aria-label=\"Submission confirmation\">\n"
+                    "<h1 role=\"status\">Submission received</h1>\n"
+                    "<p>Your form was submitted successfully. "
+                    "The server recorded these values:</p>\n"
+                    f"<dl>\n{rows_html}\n</dl>\n"
+                    "</main>\n</body></html>\n")
 
             # ─────────────── helpers ───────────────
 

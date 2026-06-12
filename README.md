@@ -40,19 +40,28 @@ truth directly from the underlying data store.
 
 ## What's in the box
 
-- **72 task generators** across 11 system apps — Reminders, Calendar, Contacts,
-  Files, Photos, Health, Maps, Safari, Messages, Settings, Shortcuts
+- **Procedural task generators** across 11 system apps — Reminders, Calendar,
+  Contacts, Files, Photos, Health, Maps, Safari, Messages, Settings, Shortcuts
 - **Cross-app workflows** such as `Messages → Contacts → Maps` (parse an
   address out of a message, save it to a contact's card, start navigation)
 - **Database-backed verifiers** that read state directly from EventKit, the
   Reminders sqlite store, `Contacts.framework`, Maps' rstorage, the Files
   sandbox, and PhotoKit. No VLM-as-judge.
 - **Persistent XCUITest server** built on Apple's first-party UI testing
-  framework — full iOS accessibility-tree access, ~200–400 ms per observation
+  framework — full iOS accessibility-tree access, ~200–400 ms per observation,
+  with `PINCH` / `DOUBLE_TAP` verbs for Maps / Photos and the Safari
+  auto-zoom recovery path
+- **Three baselines side-by-side** sharing the same task corpus and verifier
+  (see "Three baselines" below): a UI-driving agent (the original SIBB
+  scaffold), an API-only counterpart (Apple SDKs only — EventKit, Contacts,
+  MapKit, …), and a hybrid agent that picks action class per step
+- **Safari MockSite + harness-served `.test` hostnames** for reproducible
+  web-form / autofill tasks with no external network dependency
 - **Procedural task generation** with seedable randomized springboard layouts,
   distractor records, and baseline noise
-- **Uniform LLM driver** with async clients for Anthropic, Google, and OpenAI
-- **~85 tests** across a four-layer pyramid: pure-Python unit tests,
+- **Uniform LLM driver** with async clients for Anthropic, Google, and OpenAI;
+  the API baseline additionally uses native function-calling
+- **Tests** across a four-layer pyramid: pure-Python unit tests,
   fake-reader integration tests, simulator-backed integration tests, and
   Swift JSON-envelope contract tests
 
@@ -95,14 +104,30 @@ LLM — useful for sanity-checking what an agent is given on any iOS screen.
 # Procedurally generate a task corpus
 python3 sibb_task_generator_v3.py
 
-# Run an LLM-driven episode (set your model's API key first)
+# Run an LLM-driven episode — UI baseline (the original SIBB scaffold).
+# Set your model's API key first.
 export GEMINI_API_KEY=...
-python3 sibb_assistant.py --task complete_specific_reminder \
-                          --model gemini-2.5-flash --max-turns 15
+python3 sibb_assistant.py "$SIBB_UDID" \
+    --generator complete_specific_reminder \
+    --provider gemini --model gemini-2.5-flash \
+    --max-turns 15
+
+# Same task via the API-only counterpart (Apple SDKs only — Option A+).
+python3 ../api_baseline/sibb_api_assistant.py \
+    --udid "$SIBB_UDID" \
+    --task complete_specific_reminder \
+    --provider gemini --model gemini-2.5-flash
+
+# Or via the hybrid agent (picks API vs UI per step).
+python3 ../hybrid_baseline/sibb_hybrid_assistant.py \
+    --udid "$SIBB_UDID" \
+    --task complete_specific_reminder \
+    --provider gemini --model gemini-2.5-flash
 ```
 
 The full setup walkthrough — TCC permissions, baseline cloning, prewarm
-quirks, log paths — is in [`docs/SIBB_RUNBOOK.md`](docs/SIBB_RUNBOOK.md).
+quirks, Safari MockSite + `.test` DNS resolver, log paths — is in
+[`docs/SIBB_RUNBOOK.md`](docs/SIBB_RUNBOOK.md).
 
 ---
 
@@ -150,18 +175,63 @@ data store the app would persist to, not just the rendered UI.
 
 ```
 sibb/
-├── simulator/        XCUITest server, baseline prewarm, AX probes
-├── benchmark/        Task generation, scaffold, verifier, LLM driver
-├── tests/            Four-layer test pyramid
-│                       └── unit/   integration/   e2e/   contract/
-└── docs/             Runbook, design notes, iOS quirks, app coverage
+├── simulator/         XCUITest server, baseline prewarm, AX probes,
+│                        PINCH / DOUBLE_TAP verbs, zoom detection
+├── benchmark/         UI baseline — task generation, scaffold, verifier,
+│                        LLM driver, episode runner, Safari MockSite
+├── api_baseline/      API-only counterpart (Option A+) — Apple SDKs only;
+│                        empirical handle on the platform ceiling claim
+├── hybrid_baseline/   Pattern-2 hybrid agent — picks API or UI per step
+├── scripts/           One-time host helpers (DNS resolver for *.test)
+├── tests/             Four-layer test pyramid
+│                        └── unit/   integration/   e2e/   contract/
+└── docs/              Runbook, design notes, iOS quirks, app coverage
 ```
 
 A more detailed tour:
 
 - [`simulator/README.md`](simulator/README.md) — XCUITest server, simulator control
-- [`benchmark/README.md`](benchmark/README.md) — scaffold, task grammar, verifier
+- [`benchmark/README.md`](benchmark/README.md) — UI scaffold, task grammar, verifier
+- [`api_baseline/README.md`](api_baseline/README.md) — API-only baseline, per-task classification, operational definition
+- [`hybrid_baseline/PLAN.md`](hybrid_baseline/PLAN.md) — hybrid scaffold design (Pattern 2)
 - [`tests/README.md`](tests/README.md) — test pyramid, fake-reader fixtures
+
+### Three baselines
+
+```
+                              ┌─────────────────┐
+                              │ Task generator  │
+                              │ (procedural,    │
+                              │  seedable noise)│
+                              └────────┬────────┘
+                                       │ same instruction, same pre-runner
+                ┌──────────────────────┼──────────────────────┐
+                ▼                      ▼                      ▼
+        ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
+        │ UI baseline   │      │ API baseline  │      │ Hybrid agent  │
+        │ benchmark/    │      │ api_baseline/ │      │ hybrid_baseline/
+        │ XCUITest +    │      │ EventKit, CN, │      │ picks per step,
+        │ AX tree       │      │ MapKit, …     │      │ asymmetric obs
+        │ taps & types  │      │ direct calls  │      │ (AX after UI,  │
+        │               │      │ + native FC   │      │  output after  │
+        │               │      │               │      │  API)          │
+        └───────┬───────┘      └───────┬───────┘      └───────┬───────┘
+                │                      │                      │
+                └──────────────────────┼──────────────────────┘
+                                       ▼
+                          ┌────────────────────────┐
+                          │ Same DB-backed verifier│
+                          │ EventKit / sqlite /    │
+                          │ Contacts / rstorage /  │
+                          │ plist / Files / Photos │
+                          └────────────────────────┘
+```
+
+All three are scored against the same database/file-level verifier. The UI
+scaffold is the original SIBB substrate; the API-only counterpart provides
+the per-task "could-be-done-without-UI" upper bound; the hybrid baseline
+measures what an agent picks when given both — currently the only one that
+has access to both kinds of action.
 
 ---
 
@@ -176,6 +246,9 @@ A more detailed tour:
 | [`docs/MAPS_VERIFICATION.md`](docs/MAPS_VERIFICATION.md) | How the Maps active-route verifier works |
 | [`docs/AGENT_TOOL_NOTES.md`](docs/AGENT_TOOL_NOTES.md) | Per-app notes on accessibility quirks |
 | [`docs/research_summary.md`](docs/research_summary.md) | Design rationale for SIBB |
+| [`api_baseline/README.md`](api_baseline/README.md) | Why an API counterpart exists and how it's scored |
+| [`api_baseline/operational_definition.md`](api_baseline/operational_definition.md) | Operational definition of "API-doable" with worked borderline examples |
+| [`hybrid_baseline/PLAN.md`](hybrid_baseline/PLAN.md) | Hybrid scaffold (Pattern 2) design |
 
 ---
 

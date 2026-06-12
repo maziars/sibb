@@ -1,0 +1,32 @@
+SIBB benchmark — third-party data attribution
+================================================
+
+webmall_1.csv
+-------------
+
+Source:    https://github.com/wbsg-uni-mannheim/WebMall
+Paper:     https://arxiv.org/abs/2508.13024
+Authors:   Web-Based Systems Group, University of Mannheim
+Schema:    WooCommerce product export (German locale, comma decimal)
+Size:      1152 rows × 41 columns; 1.8 MB
+Vintage:   2025 Common-Crawl-derived catalog of PC components / peripherals
+           / consumer electronics with realistic titles, descriptions,
+           and prices.
+
+Used by:   sibb/benchmark/sibb_mock_site_catalog.py
+Purpose:   Seeds the SIBB mock e-commerce site for `gen_safari_shop_*`
+           generators. Loading + sampling is deterministic given an RNG
+           seed so episodes are reproducible.
+
+Citation (please cite the WebMall paper when using SIBB shop tasks
+in research):
+
+    @article{webmall2025,
+      title  = {WebMall — A Multi-Shop Benchmark for Evaluating Web Agents},
+      author = {Web-Based Systems Group, University of Mannheim},
+      journal= {arXiv preprint arXiv:2508.13024},
+      year   = {2025}
+    }
+
+The CSV is distributed unmodified from the source repository.
+The SIBB project claims no ownership of the catalog data.

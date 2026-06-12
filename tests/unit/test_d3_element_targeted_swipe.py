@@ -151,32 +151,35 @@ def test_xcuitest_reader_has_swipe_at():
 # ────────────────────── execute() routing source-lint ─────────────────
 
 def test_execute_routes_swipe_through_swipe_at_when_ref_present():
-    """The execute() body should call xc.swipe_at when an element is
-    resolved, and fall back to xc.swipe when not.
+    """SWIPE keeps the whole-app fallback (it IS the whole-screen
+    gesture verb — Spotlight, Control Center, page-flip, etc.).
+    SCROLL on the other hand requires an `@ref` since 2026-06-03 —
+    a bare SCROLL must return an error, not silently do a whole-app
+    swipe (that swipe path doesn't necessarily pan a scrollable AX
+    element; iOS may treat it as chrome interaction).
     """
     import pathlib
     src = pathlib.Path("sibb/benchmark/sibb_replay.py").read_text()
-    # The swipe and scroll branches must reference swipe_at AND
-    # the whole-app fallback.
     swipe_idx = src.find('if a == "swipe":')
     scroll_idx = src.find('if a == "scroll":')
     assert swipe_idx > 0
     assert scroll_idx > 0
     swipe_block = src[swipe_idx:src.find('if a == "scroll":', swipe_idx)]
-    scroll_block = src[scroll_idx:src.find('if a == "adjust":', scroll_idx)]
+    scroll_block = src[scroll_idx:src.find('if a == "fling":', scroll_idx)]
     assert "xc.swipe_at" in swipe_block, (
         "swipe branch should route through xc.swipe_at when element "
         "ref resolves"
     )
     assert "xc.swipe(direction=" in swipe_block, (
         "swipe branch should still fall back to whole-app xc.swipe "
-        "when no element ref"
+        "when no element ref — SWIPE is the whole-screen gesture verb"
     )
     assert "xc.swipe_at" in scroll_block, (
         "scroll branch should route through xc.swipe_at when element "
         "ref resolves"
     )
-    assert "xc.swipe(direction=" in scroll_block, (
-        "scroll branch should still fall back to whole-app xc.swipe "
-        "when no element ref"
+    assert "SCROLL requires an element reference" in scroll_block, (
+        "scroll branch must return an error when no @ref is provided "
+        "(2026-06-03: SCROLL is no longer a whole-screen swipe; use "
+        "SWIPE for whole-screen gestures)"
     )

@@ -12,7 +12,9 @@ action at a time using the same grammar an LLM would emit:
     TYPE @e017 "Hello"       tap-to-focus then type (auto-focus)
     SCROLL @e033 down 1.5    scroll inside an element
     ADJUST @e044 up 3        step a slider/picker/stepper
-    SWIPE @e021 left         swipe an element
+    SWIPE @e021 left         swipe an element (finger direction)
+    SCROLL_PAGE down         CONTENT-direction page scroll (inverts
+                             internally to the iOS-correct SWIPE)
     DONE "all set"           terminal — agent claims success
     FAIL "can't do it"       terminal — agent gives up
     ANSWER {"items": [...]}  terminal — reporting tasks: single-line JSON
@@ -108,6 +110,7 @@ from sibb_task_generator_v3 import (
     gen_full_business_card,
     gen_lookup_phone_by_name,
     # Phase 3 cross-app
+    gen_reminder_with_calendar_event,
     gen_maps_search_to_contact,
     gen_message_save_sender,
     gen_message_save_sender_with_address,
@@ -115,6 +118,12 @@ from sibb_task_generator_v3 import (
     gen_message_save_address,
     gen_message_to_contact_to_maps,
     gen_message_to_new_contact_to_maps,
+    # Phase 4 Safari Tier-1
+    gen_safari_bookmark_specific_url,
+    gen_safari_rsvp_form,
+    gen_safari_rsvp_form_clipped,
+    gen_safari_shop_pick_by_attrs,
+    gen_safari_shop_filter_and_sort,
 )
 from sibb_scaffold import (
     AXReader, AXEnricher, AXTokenizer, SIBBScaffold, AXTree, AXElement
@@ -149,6 +158,15 @@ async def verify_generic_task_async(task, xcuitest_reader, *,
 R  = "\033[0m";  B  = "\033[1m"
 CY = "\033[36m"; GR = "\033[32m"; YE = "\033[33m"
 RE = "\033[31m"; GY = "\033[90m"; BL = "\033[34m"; WH = "\033[97m"
+
+
+# Max repeats per SCROLL / SWIPE / SCROLL_PAGE action — the agent can't
+# see intermediate state during a batch, so an over-large amount commits
+# N gestures blindly before the next observation. Cap = 20 keeps each
+# action bounded to ~20 wheel ticks of overshoot, ~screen-height of pan.
+# Lifted to module scope so the SWIPE / SCROLL_PAGE executor can share
+# the same ceiling as SCROLL.
+SCROLL_MAX_AMOUNT = 20
 
 
 GENERATORS = {
@@ -265,6 +283,9 @@ GENERATORS = {
     "lookup_phone_by_name":        (gen_lookup_phone_by_name,
                                     verify_generic_task_async),
     # Phase 3 cross-app
+    "reminder_with_calendar_event":
+                                   (gen_reminder_with_calendar_event,
+                                    verify_generic_task_async),
     "maps_search_to_contact":      (gen_maps_search_to_contact,
                                     verify_generic_task_async),
     "message_save_sender":         (gen_message_save_sender,
@@ -280,6 +301,22 @@ GENERATORS = {
                                     verify_generic_task_async),
     "message_save_sender_with_address":
                                    (gen_message_save_sender_with_address,
+                                    verify_generic_task_async),
+    # Safari Tier 1 — single-app bookmark create (Phase 4)
+    "safari_bookmark_specific_url":
+                                   (gen_safari_bookmark_specific_url,
+                                    verify_generic_task_async),
+    # Safari Tier 1 — first harness-served form-fill (Phase 4)
+    "safari_rsvp_form":            (gen_safari_rsvp_form,
+                                    verify_generic_task_async),
+    # Adversarial: submit button positioned past viewport edges.
+    "safari_rsvp_form_clipped":    (gen_safari_rsvp_form_clipped,
+                                    verify_generic_task_async),
+    # Step 5M (2026-06-08) — shop flow V0: search → pick → checkout.
+    "safari_shop_pick_by_attrs":   (gen_safari_shop_pick_by_attrs,
+                                    verify_generic_task_async),
+    # Step 5P (2026-06-09) — Q4 shop flow: filter + sort cascade.
+    "safari_shop_filter_and_sort": (gen_safari_shop_filter_and_sort,
                                     verify_generic_task_async),
 }
 
@@ -320,11 +357,23 @@ HELP = f"""
   {GR}TAP{R} @e042                  tap element by ref
   {GR}TAP{R} "Add Alarm"            tap element by label substring
   {GR}TAP{R} (200, 400)             raw-coordinate tap (no AX lookup)
+  {GR}DOUBLE_TAP{R} (200, 100)       coordinate double-tap — primary
+                              use is resetting Safari's auto-zoom on
+                              a non-input page region. Also accepts
+                              @ref / "label" like TAP.
   {GR}TYPE{R} @e017 "Hello world"   tap-to-focus then type
-  {GR}SCROLL{R} down 2              scroll the screen (down = see more below)
-  {GR}                              {R}                   element ref ignored; amount = N swipes
-  {GR}ADJUST{R} @e044 up 3          step (not yet supported on XCUITest)
-  {GR}SWIPE{R} left                 swipe gesture (down = drag finger top→bottom)
+  {GR}SCROLL{R} @e042 down 2        pan a scrollable element (table/scroll/
+                              web). @ref is REQUIRED — bare SCROLL
+                              errors. Use SWIPE for whole-screen gestures.
+  {GR}FLING{R} @e042 down 1          fast-velocity element-bounded gesture
+  {GR}SWIPE{R} left                 whole-screen system gesture (page-flip,
+                              Spotlight, Control Center, app switcher).
+                              `direction` = FINGER direction.
+  {GR}SWIPE{R} @e042 left           element-bounded swipe (finger direction)
+  {GR}SCROLL_PAGE{R} down           CONTENT-direction page scroll. SCROLL_PAGE
+                              down = reveal lower content (emits SWIPE up
+                              internally). Use this when you want to think
+                              in content terms.
   {GR}PRESS{R} home                 exit to home screen
   {GR}PRESS{R} back                 in-app back gesture (left-edge swipe)
   {GR}PRESS{R} app_switcher         recent-apps carousel (swipe-up-and-hold)
@@ -411,8 +460,84 @@ def find_element(action, tree: AXTree) -> Optional[AXElement]:
         candidates = tree.find_by_label(action.target_label)
         if candidates:
             enabled = [c for c in candidates if c.enabled]
-            return (enabled or candidates)[0]
+            pool = enabled or candidates
+            return _disambiguate_by_label(pool, action.target_label, tree)
     return None
+
+
+# Roles that are interactive surfaces — preferred over decorative/text
+# elements when multiple labels collide (Step 3 fallout: prediction
+# words now reach the tree as StaticText/Other and collide on short
+# substrings). Include BOTH the lowercased ElementRole enum values
+# (production path post-role-mapping) AND raw XCUITest lowercase
+# strings (in case a caller hits us pre-mapping).
+_INTERACTIVE_ROLES_FOR_DISAMBIG = frozenset({
+    # ElementRole enum values, lowercased
+    "button", "textfield", "textview", "cell", "switch", "tab",
+    "picker", "adjustable",
+    # raw XCUITest strings
+    "btn", "input", "textarea", "link", "search",
+    "pickerwheel",
+})
+
+
+def _disambiguate_by_label(candidates, label, tree):
+    """Pick the best candidate when label-match returns multiple.
+
+    Two ambiguities Step 3 introduced (the accessory bar now reaches
+    the agent):
+      A. Multi-`Done`: sheet/nav confirmation Done at top of sheet
+         (small y, role=btn) vs accessory-bar Done at kb top.
+      B. Common-word predictions: prediction words like "I" / "The" /
+         "and" come through as `[other]` / `[StaticText]`. They can
+         poison short-substring searches.
+
+    Rules:
+      1. If kb is up AND `target_label` matches an accessory-bar
+         button label exactly (case-insensitive), prefer the candidate
+         OUTSIDE the accessory bar (frame.y + height ≤ accessory top).
+         Falls back to the bar Done if no non-bar match.
+      2. Prefer candidates whose role is in `_INTERACTIVE_ROLES_FOR_DISAMBIG`
+         (button/input/cell/etc.) over StaticText/Other — handles the
+         prediction-word collision.
+      3. Otherwise return the first candidate (legacy behavior).
+
+    Pre-Step-3 there was no ambiguity to resolve because the bar's
+    elements were filtered out before reaching the tree. Keeping
+    behavior identical for single-match cases avoids regressing
+    existing tasks."""
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+
+    target = (label or "").strip().lower()
+    acc_frame = getattr(tree, "accessory_bar_frame", None)
+
+    # Rule 1 — multi-Done / Next / Previous when kb is up.
+    if (acc_frame and target in {"done", "next", "previous"}):
+        acc_top = acc_frame.get("y")
+        if acc_top is not None:
+            # Prefer candidates whose entire frame sits ABOVE the
+            # accessory bar (= sheet/nav button, not the bar's button).
+            non_bar = [c for c in candidates
+                       if c.frame and c.frame.y + c.frame.height
+                            <= acc_top]
+            if non_bar:
+                return non_bar[0]
+            # All candidates are at the bar. Use the bar's Done.
+
+    # Rule 2 — prefer interactive roles for short / common queries
+    # (prediction words usually come through as StaticText / Other).
+    if len(target) <= 3:
+        interactive = [c for c in candidates
+                       if (getattr(c, "role", None)
+                            and (c.role.value.lower()
+                                 if hasattr(c.role, "value")
+                                 else str(c.role).lower())
+                                in _INTERACTIVE_ROLES_FOR_DISAMBIG)]
+        if interactive:
+            return interactive[0]
+
+    return candidates[0]
 
 
 async def _wait_for_focus_at(xc, tap_x: float, tap_y: float,
@@ -475,6 +600,34 @@ async def execute(reader: AXReader, action, tree: AXTree) -> dict:
         return {"success": True, "slept_ms": int(wait_ms),
                 "note": "OBSERVE — pure no-op, fresh AX on next turn"}
 
+    if a == "return":
+        # Fire the Return key into the currently keyboard-focused
+        # element via Swift's `app.typeText("\n")`. iOS dispatches the
+        # event against the focused field's keyboard configuration,
+        # firing whatever the Return key is contextually labeled —
+        # Go / Search / Done / Next / plain Return. We don't need to
+        # know which; the field does the right thing on receiving "\n".
+        #
+        # PRIMARY USE: commit a typed URL in Safari's URL bar (the
+        # keyboard's Return key isn't surfaced in AX, so the agent has
+        # no other way to commit — tapping a suggestion submits as
+        # search instead).
+        #
+        # Step 5L-C (2026-06-08) — Swift returns a structured
+        # `{ok: false, error: "no_keyboard", hint: "..."}` when the
+        # keyboard isn't visible. Surface that to the agent so it
+        # learns to TAP-to-focus first.
+        resp = await xc._send({"type": "return"})
+        if not resp.get("ok", True):
+            err = resp.get("error", "unknown")
+            hint = resp.get("hint", "")
+            return {"success": False,
+                    "error": f"RETURN failed: {err}",
+                    "hint": hint,
+                    "note": "RETURN requires a focused text input"}
+        return {"success": True,
+                "note": "RETURN fired \\n into focused element"}
+
     if a == "answer":
         # ANSWER is terminal — payload is on the action itself (parsed
         # by SIBBScaffold.parse_action). Captured by the run-task loop
@@ -509,6 +662,59 @@ async def execute(reader: AXReader, action, tree: AXTree) -> dict:
         return {"success": True, "coords": (round(x), round(y)),
                 "ref": el.ref, "label": el.effective_label}
 
+    if a == "double_tap":
+        # Coordinate-based double-tap. Dispatches via Swift's native
+        # `XCUICoordinate.doubleTap()` — the gesture path that fires
+        # WebKit's double-tap-to-zoom recognizer on Safari (the agent's
+        # only reliable auto-zoom reset). Same target-resolution
+        # semantics as TAP: raw coord > @ref > label match.
+        #
+        # The xc.double_tap() raises RuntimeError on `ok:false` (older
+        # SIBBHelper builds return `unknown:double_tap` from the
+        # default case). We catch and surface as a structured result
+        # so the turn loop doesn't abort the episode.
+        if action.target_x is not None and action.target_y is not None:
+            x, y = action.target_x, action.target_y
+            try:
+                await xc.double_tap(x=x, y=y)
+            except RuntimeError as e:
+                return {"success": False,
+                         "error": (f"DOUBLE_TAP dispatch failed: {e}. "
+                                   f"If the SIBBHelper build is older "
+                                   f"than 2026-06-06, rebuild via "
+                                   f"./sibb_xcuitest_setup.sh <UDID>.")}
+            return {"success": True, "coords": (round(x), round(y)),
+                    "note": "raw coordinate double-tap"}
+        el = find_element(action, tree)
+        if not el:
+            return {"success": False,
+                     "error": f"element not found "
+                              f"(ref={action.target_ref!r} "
+                              f"label={action.target_label!r})"}
+        if not el.frame:
+            return {"success": False,
+                     "error": f"@{el.ref} has no frame"}
+        # Consistency with TAP: refuse disabled elements. For the
+        # PRIMARY USE (Safari zoom reset by coord), this branch is
+        # not reached. For @ref / label dispatch on a button/link,
+        # disabled means "no action would occur" and surfacing the
+        # failure is preferable to silent no-op.
+        if not el.enabled:
+            return {"success": False,
+                     "error": (f"@{el.ref} '{el.effective_label}' is "
+                               f"disabled")}
+        x, y = el.frame.center_x, el.frame.center_y
+        try:
+            await xc.double_tap(x=x, y=y)
+        except RuntimeError as e:
+            return {"success": False,
+                     "error": (f"DOUBLE_TAP dispatch failed: {e}. "
+                               f"If the SIBBHelper build is older "
+                               f"than 2026-06-06, rebuild via "
+                               f"./sibb_xcuitest_setup.sh <UDID>.")}
+        return {"success": True, "coords": (round(x), round(y)),
+                 "ref": el.ref, "label": el.effective_label}
+
     if a == "type":
         # Two paths:
         # 1. TYPE @ref "text" (auto-focus): use the atomic Swift
@@ -533,19 +739,85 @@ async def execute(reader: AXReader, action, tree: AXTree) -> dict:
             kb_frame = getattr(tree, "keyboard_frame", None)
             screen_w = getattr(tree, "screen_width", 402)
             screen_h = getattr(tree, "screen_height", 874)
+            # `keyboard_y_min` is just kb_frame.y as of 2026-06-06.
+            # Used to be a union with `accessory_bar_frame.y` so the
+            # check also rejected taps onto the predictive bar / kb
+            # accessory toolbar. We dropped the union when an empirical
+            # probe proved the bar elements (`Done`/`Next`/`Previous`/
+            # prediction words) are useful labeled buttons the agent
+            # SHOULD be able to tap. They appear in the AX tree as
+            # first-class elements; replay routes a TAP/DOUBLE_TAP at
+            # the bar's coords to that element directly.
+            kb_y_min = getattr(tree, "keyboard_y_min", None)
+            if kb_y_min is None and kb_frame is not None:
+                kb_y_min = kb_frame.get("y")
+            el_focused = bool(getattr(el, "focused", False))
             if tap_x < 0 or tap_x > screen_w or tap_y < 0 or tap_y > screen_h:
                 return {"success": False,
                          "error": (f"target field's center "
                                    f"({tap_x:.0f},{tap_y:.0f}) is "
-                                   f"off-screen — scroll into view first")}
-            if (kb_frame is not None
-                    and tap_y >= kb_frame.get("y", 99999)):
-                return {"success": False,
-                         "error": (f"target field's center is below "
-                                   f"the keyboard (y={tap_y:.0f} >= "
-                                   f"kb_top={kb_frame.get('y'):.0f}); "
-                                   f"scroll the form or dismiss the "
-                                   f"keyboard first")}
+                                   f"off-screen — scroll into view first"),
+                         "kb_y_min_used": kb_y_min}
+            # Focused-element exemption: the scaffold exempts focused
+            # fields from the visibility filter so the agent always
+            # sees "what am I typing into". The pre-tap occlusion check
+            # must be symmetric — but tapping below-kb coords would
+            # still route the tap into the keyboard. So when the field
+            # is already focused, skip the tap entirely and route to
+            # raw type_text (the kb already has the field's responder).
+            if kb_y_min is not None and tap_y >= kb_y_min:
+                if not el_focused:
+                    return {"success": False,
+                             "error": (f"target field's center is below "
+                                       f"the keyboard (y={tap_y:.0f} >= "
+                                       f"kb_top={kb_y_min:.0f}); "
+                                       f"scroll the form or dismiss the "
+                                       f"keyboard first"),
+                             "kb_y_min_used": kb_y_min}
+                # Focused + below-kb: type into the live responder.
+                if not action.text:
+                    return {"success": True, "typed": "",
+                             "note": "empty text; no-op (focused)"}
+                # TOCTOU guard: the agent's tree was captured at
+                # observation time; between observe and TYPE, the
+                # simulator can drop / move focus (animation, modal,
+                # auto-Return-press on a prior turn). type_text dispatches
+                # to whatever's currently focused — without this check,
+                # we could leak keystrokes into the wrong field. Re-
+                # observe and verify the live focused element's frame
+                # still contains the originally-targeted tap point. If
+                # it doesn't, refuse to type and tell the agent.
+                live = await xc.observe()
+                live_focused = next(
+                    (e for e in live.elements
+                     if getattr(e, "focused", False) and e.frame), None)
+                # `live.elements[].frame` is the xcuitest_client Frame
+                # type (no .contains method) — inline the bbox check.
+                def _frame_contains(fr, x, y):
+                    return (fr.x <= x <= fr.x + fr.width
+                            and fr.y <= y <= fr.y + fr.height)
+                if (live_focused is None
+                        or not _frame_contains(
+                            live_focused.frame, tap_x, tap_y)):
+                    live_focused_label = (
+                        getattr(live_focused, "label", None)
+                        if live_focused is not None else None)
+                    return {
+                        "success": False,
+                        "error": (
+                            f"TYPE @{el.ref} aborted: between observation "
+                            f"and TYPE, focus moved off the target field. "
+                            f"Re-observe and re-tap. Current focused "
+                            f"element: {live_focused_label!r}."),
+                        "kb_y_min_used": kb_y_min,
+                        "focus_moved": True,
+                    }
+                await xc.type_text(text=action.text)
+                return {"success": True, "typed": action.text,
+                         "note": ("typed into already-focused field; "
+                                  "tap omitted because field is below "
+                                  "the keyboard (this is success)"),
+                         "kb_y_min_used": kb_y_min}
             if not action.text:
                 return {"success": True, "typed": "",
                          "note": "empty text; no-op"}
@@ -656,19 +928,66 @@ async def execute(reader: AXReader, action, tree: AXTree) -> dict:
         # SWIPE direction is finger direction (drag direction), not
         # content direction.
         direction = (action.direction or "left").lower()
+        # SWIPE/SCROLL_PAGE may carry an `amount` (number of repeats),
+        # cap matching SCROLL to keep the agent's blind-batch bounded.
+        amount = int(action.amount or 1)
+        capped = False
+        if amount > SCROLL_MAX_AMOUNT:
+            amount = SCROLL_MAX_AMOUNT
+            capped = True
+        amount = max(1, amount)
         el = find_element(action, tree) if (
             action.target_ref or action.target_label) else None
         if el and el.frame:
             x1, y1, x2, y2 = _swipe_coords_for_finger_direction(
                 el.frame, direction)
-            await xc.swipe_at(x1, y1, x2, y2)
-            return {"success": True, "direction": direction,
-                    "ref": el.ref, "label": el.effective_label,
-                    "from": (round(x1), round(y1)),
-                    "to": (round(x2), round(y2))}
-        await xc.swipe(direction=direction)
-        return {"success": True, "direction": direction,
-                "note": "whole-app swipe (no element ref)"}
+            for _ in range(amount):
+                await xc.swipe_at(x1, y1, x2, y2)
+            result = {"success": True, "direction": direction,
+                       "ref": el.ref, "label": el.effective_label,
+                       "from": (round(x1), round(y1)),
+                       "to": (round(x2), round(y2)),
+                       "swipes": amount}
+            if capped:
+                result["capped"] = True
+                result["requested_swipes"] = int(action.amount or 1)
+            return result
+        for _ in range(amount):
+            await xc.swipe(direction=direction)
+        result = {"success": True, "direction": direction,
+                   "swipes": amount,
+                   "note": "whole-app swipe (no element ref)"}
+        if capped:
+            result["capped"] = True
+            result["requested_swipes"] = int(action.amount or 1)
+        return result
+
+    if a == "pinch":
+        # Two-finger pinch on the whole-app frame. Used primarily as
+        # the recovery for Safari's auto-zoom on input focus — see
+        # `IOS_SIM_QUIRKS §21`. The parser leaves either:
+        #   * `direction in ("out", "in")` — we map to canonical
+        #     scale (0.5 for out, 2.0 for in); OR
+        #   * `amount` carrying an explicit scale (e.g. 0.6).
+        # `amount=1.0` is the parser's default sentinel; when there's
+        # no direction AND amount is exactly 1.0, treat as `out`.
+        direction = (action.direction or "").lower()
+        scale: float
+        if action.amount is not None and action.amount != 1.0:
+            scale = float(action.amount)
+        elif direction == "in":
+            scale = 2.0
+        else:
+            scale = 0.5  # default & explicit "out"
+        # Velocity 1.0 scale/second is iOS' documented sane default.
+        resp = await xc.pinch(scale=scale, velocity=1.0)
+        return {
+            "success": True,
+            "scale": scale,
+            "direction": direction or ("out" if scale < 1.0 else "in"),
+            "note": ("whole-app pinch; iOS routes to focused scroll-"
+                     "view (WKWebView for Safari)"),
+        }
 
     if a == "scroll":
         # SCROLL is content-direction (down = see more content below),
@@ -678,6 +997,29 @@ async def execute(reader: AXReader, action, tree: AXTree) -> dict:
         # state during a batch, so an over-large amount commits N swipes
         # blindly before the next observation. Cap = 10 keeps each action
         # bounded to ~10 wheel ticks of overshoot).
+        #
+        # SCROLL REQUIRES @ref (2026-06-03 design).
+        # Bare SCROLL was previously a whole-screen swipe — but that's
+        # what SWIPE is for. SCROLL is for panning a scrollable element
+        # (UIScrollView / UITableView / UICollectionView / WKWebView).
+        # The agent must name the scrollable element so iOS treats the
+        # gesture as a content pan, not a chrome interaction (URL bar,
+        # tab strip, system gesture). For whole-screen gestures
+        # (Spotlight, Control Center, Notification Center, app switcher,
+        # page-flip) use SWIPE direction.
+        if not (action.target_ref or action.target_label):
+            return {
+                "success": False,
+                "error": (
+                    "SCROLL requires an element reference. Use "
+                    "`SCROLL @<ref> <direction>` to pan a scrollable "
+                    "element (UIScrollView / table / WebView). "
+                    "For whole-screen gestures (Spotlight, Control "
+                    "Center, page-flip, app switcher) use "
+                    "`SWIPE <direction>` instead."
+                ),
+                "scroll_dir": (action.direction or "down").lower(),
+            }
         SCROLL_TO_FINGER = {
             "down":  "up",     # see content below → drag finger up
             "up":    "down",
@@ -693,8 +1035,8 @@ async def execute(reader: AXReader, action, tree: AXTree) -> dict:
         # Per-swipe socket recv timeout is 60s; each swipe_at is its
         # own round-trip, so the cap bounds the agent's per-turn
         # budget, not the socket. For larger jumps the agent should
-        # use FLING (max 3, each ~20-30 ticks).
-        SCROLL_MAX_AMOUNT = 20
+        # use FLING (max 3, each ~20-30 ticks). SCROLL_MAX_AMOUNT is
+        # module-level so SWIPE / SCROLL_PAGE share the same ceiling.
         scroll_dir = (action.direction or "down").lower()
         finger_dir = SCROLL_TO_FINGER.get(scroll_dir, "up")
         n_req = max(1, int(action.amount or 1))
@@ -763,19 +1105,25 @@ async def execute(reader: AXReader, action, tree: AXTree) -> dict:
                         f"jumps use FLING (each fling ≈ 20-30 ticks)."
                     )}
 
-        # Whole-app fallback when no ref / unresolvable.
-        for _ in range(n):
-            await xc.swipe(direction=finger_dir)
-        return {"success": True, "scroll_dir": scroll_dir,
-                "finger_dir": finger_dir, "swipes": n,
-                "requested_swipes": n_req,
-                "capped": capped,
-                "note": (
-                    "whole-app scroll (no element ref)" if not capped else
-                    f"whole-app SCROLL capped from {n_req} to "
-                    f"{SCROLL_MAX_AMOUNT}. Max SCROLL is "
-                    f"{SCROLL_MAX_AMOUNT} swipes/turn."
-                )}
+        # If we got here, the action had a ref/label but the element
+        # couldn't be resolved (off-screen, stale snapshot) or it has
+        # no frame. We deliberately do NOT fall back to a whole-screen
+        # swipe — that's SWIPE's job. Return a clear error so the agent
+        # re-observes and picks a fresh scrollable element ref.
+        return {
+            "success": False,
+            "error": (
+                f"SCROLL target {action.target_ref or action.target_label!r} "
+                "couldn't be resolved in the current snapshot, or has no "
+                "frame. Re-observe and pick a visible scrollable element "
+                "(role: scroll / table / collection / web). For "
+                "whole-screen gestures use SWIPE instead."
+            ),
+            "scroll_dir": scroll_dir,
+            "finger_dir": finger_dir,
+            "requested_ref": action.target_ref,
+            "requested_label": action.target_label,
+        }
 
     if a == "fling":
         # FLING: high-velocity, larger-distance gesture for big jumps.

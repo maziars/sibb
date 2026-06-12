@@ -880,7 +880,7 @@ tree at any moment carries the slice of body content near the
 viewport, and scrolling re-windows the tree.
 
 **Quantitative caveats** — what this finding does NOT mean:
-- **Coverage is small per scroll.** Pluto reached cumulative 15–17
+- **Coverage is small per scroll.** Pluto reached cumulative 15
   substantive labels after 4 scrolls. The article has ~600
   sentences, so ≤3% of the body becomes available within a
   realistic scroll budget. "Agent can read the full body" is
@@ -888,13 +888,17 @@ viewport, and scrolling re-windows the tree.
   reading the whole article would take ~150–200 scrolls. Realistic
   tasks: "find this fact / answer this question" where the answer
   is plausibly within the first ~5 viewports.
-- **Retention is untested.** The probe never checked whether
-  labels seen at scroll N still appear at scroll N+2 after the
-  agent scrolls past them. Wiki/IOS run A saw 197 → 109 elements
-  in mid-walk and only partial recovery to 137 — consistent with
-  AX nodes being evicted, not just shifted. Until a retention
-  probe confirms otherwise, treat earlier-viewport content as
-  potentially lost once scrolled past.
+- **Retention: HIGH (2026-06-03 follow-up).** A retention pass
+  (scroll down 4 → scroll back up 4 → re-snapshot) recovered
+  3/3 baseline labels on wiki/IOS and 7/7 on wiki/Pluto. The AX
+  tree behaves cumulatively for a scroll-back path; once-visible
+  body labels reappear when the agent navigates back to where they
+  were. Generators can treat body reads as "extract a fact within
+  the first 4-5 viewports; the agent can re-find it by scrolling
+  back if needed." Caveat: this was measured only on Wikipedia,
+  and only via element-targeted SCROLL within the WebView frame
+  — fixed-coordinate swipes that escape the WebView bounds will
+  not pan the page at all (see SCROLL section below).
 - **Generalization is untested.** The probe only walked
   `wiki/IOS` and `wiki/Pluto`. Other content types (Reddit
   threads, PDF in Safari, long Substack/blog posts, paywalled
@@ -930,6 +934,22 @@ iOS 26.3 Wikipedia only):**
   AX nodes can be evicted, not merely shifted. Either way,
   agents should query by *label content + role*, never by
   absolute element index across turns.
+
+**SCROLL must target a scrollable AX element (2026-06-03).** The
+2026-06-01 probe used fixed `swipe_at` coordinates (e.g. from
+`y=H*0.85` to `y=H*0.18`) and worked on a Safari layout where the
+URL bar was at the BOTTOM. A re-run with the bar at the TOP
+discovered the swipe path passed through chrome (URL bar / tab
+strip) and iOS treated the gesture as a chrome interaction
+rather than a WebView pan — every snapshot returned identical
+element counts because no scrolling actually happened. The fix
+is to find the scrollable element (Safari WebView has
+`role: "web"`; Maps' map has `role: "map"`/`"scroll"`; lists are
+`role: "table"` or `"collection"`) and bound the swipe entirely
+within its frame. This generalizes across apps: SCROLL is for
+panning a scrollable AX element, not for whole-screen gestures
+(those go through SWIPE). The agent grammar enforces this — bare
+`SCROLL down` without an `@ref` returns an error suggesting SWIPE.
 
 **Bottom-bar URL chrome on iOS 26.** Safari moved the URL bar +
 Page Menu + Back/More buttons to the BOTTOM by default. The bar
@@ -1319,6 +1339,464 @@ pair-and-merge into adjacent interactive elements, etc.) was
 designed but deferred — the simpler denylist covers Maps' route
 summaries which was the motivating case. Re-evaluate if any other
 SIBB-11 app surfaces a similar gap.
+
+---
+
+## 21. Safari auto-zoom puts WebView content in zoomed-doc coords
+
+**When this bites**: iOS Safari auto-zooms when the user focuses a
+form input whose computed `font-size < 16px`. After zoom, the AX
+snapshot reports WebView content (form fields, buttons) in **zoomed-
+document** coordinates — scaled by the current zoom factor — while
+iOS Safari chrome (URL bar, keyboard) stays in **screen** coordinates.
+The two coord systems coexist in the same snapshot. Symptoms:
+
+* `keyboard_frame.y` larger than `screen_height` (e.g. y=891 on a 874-
+  tall screen — geometrically impossible in screen coords).
+* Form container frame wider than `screen_width` (e.g. 563 wide on
+  402-wide screen).
+* Small leaf elements (a 122×31 submit button) still **fit** within
+  screen bounds even though their coords are in zoomed-doc space —
+  the naive "is frame within screen?" viewport filter lets them
+  through. A TAP at the reported coord lands on a dead area.
+
+**What `sibb_scaffold` does** (`sibb_scaffold.py:_read_xcuitest`):
+
+Detects zoom via two signals (Step 4, 2026-06-07 — stateless,
+per-frame):
+
+1. **Swift-reported `zoom_scale`** — authoritative when present
+   (`dumpTree` probes WKWebView via KVC). Placeholder slot today;
+   the KVC probe is still a no-op.
+2. **kb-above-screen heuristic** — `kb_y_top > screen_h` is the
+   smoking-gun symptom we observed empirically. Has not been seen
+   firing in any probe yet.
+
+**No latch, no per-reader state.** The previous design used a 3-signal
+cascade (Swift > overflow-width > kb-above-screen) with a 2-snapshot
+release latch on `AXReader`. Empirical probe
+(`sibb_probe_autozoom_lifecycle.py`, 2026-06-06) showed signals are
+stable across consecutive frames — no flicker. The same probe also
+showed the overflow heuristic was a false positive on every Safari
+page with content wider than the viewport (baseline state with no
+zoom reported overflow=1.60). Step 4 dropped both the latch and the
+overflow heuristic. Detection is effectively always False today,
+which is honest — the agent uses `DOUBLE_TAP (200, 100)` defensively
+when they experience a zoom problem rather than trusting a header
+tag we can't reliably set.
+
+**Chrome bounds are runtime-derived** (not pixel-tuned for one
+device + orientation):
+
+* `top_chrome_bottom`: max-bottom of any small AX text near `y=0`
+  (status bar / tab strip). Falls back to 50px.
+* `bottom_chrome_top`: min(URL bar y, keyboard top). Falls back to
+  `screen_h - 100`. As of Step 3 (2026-06-06) the accessory bar is
+  NOT one of the inputs — its elements are agent-visible UI, not
+  chrome.
+
+This makes the filter land correctly across iPhone SE / Pro Max /
+iPad / portrait + landscape without per-device tuning.
+
+**Predictive bar + inputAccessoryView**: Swift still emits the union
+of the "Typing Predictions" strip and any `Previous` / `Next` / `Done`
+keyboard accessory frames as `accessory_bar_frame`. As of 2026-06-06
+this is **diagnostic-only** — `keyboard_y_min` is now just
+`kb_frame.y`. The empirical probe
+(`sibb_probe_autozoom_lifecycle.py`) showed iOS exposes
+`Previous` / `Next` / `Done` as fully-labeled `[btn]` elements with
+real frames in the AX tree; the agent SHOULD be able to tap them
+(`Done` dismisses the kb; `Next`/`Previous` walk form focus; the
+prediction words autofill). Hiding them via union was a bug. Form
+fields BEHIND the bar are still filtered — they ARE genuinely below
+the kb top, so the bare `kb_frame.y` threshold catches them.
+
+**Orientation**: derived from `screen_w > screen_h` and exposed as
+`tree.orientation`; surfaces as `LANDSCAPE` in the assistant's step
+header.
+
+**Tests**: `sibb/tests/unit/test_scaffold_zoom_detection.py` covers
+both surviving signal paths (Swift `zoom_scale` + `kb-above-screen`),
+the stateless per-frame behavior (no latch as of Step 4), runtime
+chrome derivation, accessory-bar diagnostic surfacing, orientation
+derivation, and a landscape regression that asserts form fields at
+`y > 302` are not dropped as "chrome".
+
+**Smoking-gun probe**: `sibb/simulator/sibb_probe_safari_form_ax.py`
+streams the live AX while a human / agent interacts with the form;
+the probe data from 2026-06-05 (form container 563px wide on 402px
+screen; submit button 122×31 at zoomed-doc center; kb_top=891 vs
+screen_h=874) is what motivated this entry.
+
+**Correction (2026-06-06)**: an earlier version of this section
+claimed AX coords for WebView content were in zoomed-doc coordinates
+and that a coord-system filter was needed. **Screenshot-overlay
+verification (`sibb_probe_pinch_recovery.py` with the annotated PNG
+output) disproved this.** AX element frames ARE real screen
+coordinates even when auto-zoomed:
+
+* The form-container reported at 563×194 on a 402-wide screen just
+  means the element extends past the visible viewport — the visible
+  portion is at its reported coords, the rest is clipped.
+* The submit button reported at center (61, 580) is **exactly where
+  the button is painted on screen**. TAPs at those coords hit.
+* The existing `_is_fully_visible` filter (geometric bbox check
+  against screen + kb) is doing the right job: elements whose entire
+  frame falls outside the viewport get filtered, the rest reach the
+  agent at correct coords.
+
+Zoom detection therefore stays as an **informational** signal
+(`AUTO-ZOOMED=1.5x(swift|overflow|kb_above_screen)` in the
+tokenizer header), but does NOT drive any further filtering.
+
+**Recovery options for the agent**:
+
+| Action | Resets WebView zoom? |
+|---|---|
+| `TAP @<URL bar>` (opens Smart Search) | ❌ no |
+| `PRESS home` (drop to springboard) | ❌ no |
+| App-switcher (`PRESS app_switcher`) trip | ❌ no |
+| `PINCH out` via XCUITest | ❌ no — Apple's WebKit bug 234584-class limits programmatic pinch on WKWebView |
+| Two rapid `xc.tap()` calls at same coord | ❌ no — synthetic-tap event path doesn't feed WebKit's double-tap recognizer |
+| **`DOUBLE_TAP (x, y)` via `XCUICoordinate.doubleTap()`** on a non-input region | **✅ yes — verified 2026-06-06 via real-trackpad probe; the native gesture API dispatches through the same touch pipeline as real input devices, which IS what WebKit's zoom-fit recognizer listens to** |
+| Manual Option+drag on the sim (pinch) | ✅ yes (host-side gesture, also agent-reachable via DOUBLE_TAP now) |
+
+**Recommendation**: when AUTO-ZOOMED is detected, emit
+`DOUBLE_TAP (x, y)` with `x, y` in the top quarter of the viewport
+(e.g. `(200, 100)`) — page chrome / heading area, safe to double-tap
+without triggering input focus. This is the canonical Safari zoom
+reset.
+
+**Sim probe for verification**:
+`sibb/simulator/sibb_probe_pinch_recovery.py` opens the RSVP form,
+focuses an input (triggers auto-zoom), issues `PINCH out`, and saves
+six annotated PNGs to `/tmp/sibb_probe_*.png`:
+* `1a` / `1b` — baseline raw + scaffold-filtered (what the agent sees)
+* `2a` / `2b` — post-focus raw + filtered
+* `3a` / `3b` — post-pinch raw + filtered
+
+Compare visually to confirm AX coords match painted positions.
+
+**Robustness hardening (task #210–#228, 2026-06-06)**:
+
+* `AXReader.reset_episode_state()` was needed only for the zoom latch.
+  Step 4 (2026-06-07) dropped the latch and removed the method along
+  with calls from `sibb_assistant.py`, `sibb_replay.py`,
+  `sibb_episode.py`, `sibb_episode_runner.py`. Cross-episode state
+  on `AXReader` is now zero. (Earlier docs:)
+* Replay's pre-tap occlusion guard consumes `keyboard_y_min` (=
+  `kb_frame.y` as of Step 3 — bare keyboard top, no longer unioned
+  with accessory bar). Taps below the kb top are rejected with a
+  "below the keyboard" diagnostic; the bar's elements (Done / Next
+  / Previous / predictions) are now agent-tappable and live above
+  this threshold.
+* Python-side `_derive_chrome_bounds` gates English-literal label
+  matches (`Address`, etc.) behind a role + geometry check: role
+  key normalized via `_chrome_role_key` to one of
+  `{btn, button, input, textfield, search, toolbar, other}`
+  (handles BOTH raw XCUITest lowercase strings — production —
+  AND `ElementRole` enums — test fixtures), `frame.height ≤ 60`, and
+  position guard `fr.y < kb_y_top` when the keyboard is up
+  (orientation-independent) else `fr.y ≥ screen_h * 0.5` as a portrait
+  fallback. Sheet "Done" buttons, nav-bar confirmations, and tall
+  toolbars no longer spuriously shrink the chrome region.
+* Swift-side `gatherAccessory` (in `sibb_xcuitest_setup.sh`) now
+  requires `keyboardVisible == true`, `frame.y < keyboardTop`
+  (orientation-independent — the earlier `> screen_h * 0.5` clause
+  silently rejected the predictive bar in landscape, where the kb
+  top sits at ~y=170 and the bar at ~y=130 was below the half-screen
+  line), and per-label role+height gating (`.button` + `height < 50`
+  for Done/Next/Previous; `.other` allowed for the Typing Predictions
+  container with `height < 60`). **Requires a SIBBHelper rebuild**
+  (`./sibb_xcuitest_setup.sh <UDID>`) to take effect on the sim.
+* (Earlier doc — superseded by Step 4 bullet above:
+  `reset_episode_state()` and its 4 runner call sites were the
+  Step-3-era mitigation for the latch leak. Step 4 dropped the
+  latch entirely, removing the need for the reset call.)
+* Replay's pre-tap occlusion check now ROUTES focused-below-kb
+  fields to raw `type_text` (skipping the tap entirely) instead
+  of rejecting them. The scaffold exempts focused fields from
+  the visibility filter so the agent can see them, and the
+  executor must be symmetric — the kb already holds the field's
+  responder, retap-then-type would just hit the keyboard. The
+  rejection branch remains for non-focused below-kb fields (which
+  the visibility filter normally drops, but is the safety net).
+* The `bottom_chrome_top >= screen_h * 0.5` clamp was relaxed —
+  it was forcing the chrome region to live below the half-screen
+  line even when the keyboard genuinely covered more than half
+  the screen (landscape iPhone case). New invariant: `bottom >
+  top` only.
+* Dead labels (`toolbar`, `tab bar`) pruned from
+  `_SAFARI_BOTTOM_CHROME_LABELS` — after the role+height gate
+  landed, no real Safari element can pass them. The dead-code
+  `_is_chrome` helper was removed (leftover from the 2026-06-06
+  coord-system filter revert).
+* Executor result dict now exposes `kb_y_min_used` — the actual
+  occlusion threshold the pre-tap decision used. Tests assert
+  on this structured field instead of substring-matching the
+  human-readable error message.
+* Tree now carries `top_chrome_bottom` + `bottom_chrome_top`
+  alongside the existing `zoom_factor` / `zoom_source` /
+  `coord_system_zoomed` / `orientation` / `keyboard_y_min` /
+  `kb_filtered_count` / `viewport_filtered_count`. Assistant's
+  per-turn JSONL record now includes a `"diagnostics"` sub-dict
+  with these values via `_tree_diagnostics(tree)` in
+  `sibb_assistant.py`. The contract is pinned by an L1 test
+  (`test_assistant_diagnostics.py`) — the key set is held stable.
+* `SCROLL_PAGE` verb added — content-direction semantic synonym
+  for SWIPE. The clipped-button benchmark showed agents trip on
+  iOS SWIPE direction semantics (SWIPE down = finger down =
+  content goes UP not down) and loop. `SCROLL_PAGE down` =
+  "show me lower content" maps internally to `SWIPE up`. Per-turn
+  agents now have a verb whose direction matches their
+  intuition. SYSTEM_PROMPT gained a "DIRECTION SEMANTICS"
+  callout under SWIPE.
+
+### Distractor-stack hit-zones under auto-zoom (2026-06-07)
+
+**When this bites**: stacked `<button>` elements (the form's real
+Submit + 2-3 distractor buttons rendered by
+`harness_layout.distractor_buttons`) are categorically unhittable
+in their middle position under iOS Safari auto-zoom — *not because
+of a coord-system bug, but because the rendered layout doesn't
+respect Apple's 44 pt minimum tap target.*
+
+Empirically observed via `sibb/simulator/sibb_probe_zoom_hit_zone.py`
+on the seed=1 RSVP form (page_seed=506456970, font-size=13 px) AND
+its `force_font_size=16` no-zoom control (same `page_seed`, only
+the zoom condition differs):
+
+**Two distinct effects compounding under zoom:**
+
+1. **AX-frame inflation by ~2 pt** — WebKit reports wider buttons
+   ("Discard Changes" 162 px, "Remind Me Later" 162 px) as h=32 under
+   zoom vs h=30 under no-zoom. The narrow middle button ("Preview"
+   94 px) stays at h=30. With zero inter-form margin, neighbor AX
+   frames overlap by 2 pt at top and bottom, and iOS hit-test snaps
+   the middle button's hits to whichever neighbor owns the overlapped
+   strip. **Step 5c fix**: 8 px `margin-top` on every distractor
+   form. Verified: AX frames no longer overlap.
+
+2. **"Fat finger" hit-area inflation by ~11 pt each direction** —
+   even after fixing (1), the empirical hit-zone of each wide neighbor
+   extends ~11 pt past its AX-reported bottom (and the next neighbor
+   extends ~11 pt above its AX-reported top). The narrow middle button
+   in between has no inflated counterpart, so its only y range free
+   of neighbors is a narrow strip (~16 pt at 4 pt scan resolution:
+   y=649..665, 5 sampled taps) — and at those values, no tap registers
+   any POST. The visual button is rendered too small for iOS's touch
+   pipeline to route the tap. **Step 5d fix**: `min-height: 44px;
+   min-width: 44px; padding: 8px 16px` on every submit/distractor
+   button (including the clipped variant's inline-built Submit).
+
+**Compare conditions** (`page_seed=506456970`, x_scan=47, scan-step=4 pt;
+"Hits" column is from the post-5c, pre-5d layout — the intermediate
+state where AX frames are clean but button rendering is still UA
+default):
+
+| Button | Zoom AX (pre-fix) | Zoom AX (post-5c) | No-zoom AX (control) | Hits (post-5c, pre-5d) |
+|---|---|---|---|---|
+| submit | y=553..585 (h=32) | y=553..585 | y=549..579 (h=30) | — (validation popup) |
+| discard | y=602..634 (h=32) | y=602..634 | y=594..624 (h=30) | y=597..645 (49 sample pts ≈ 48 pt span) |
+| **preview** | **y=632..662 (h=30) — 2 pt overlap both sides** | **y=642..672 (clean)** | **y=624..654 (h=30)** | **GHOSTED in zoom, hits y=625..649 in no-zoom** |
+| remind | y=660..692 (h=32) | y=680..712 | y=653..683 (h=30) | y=649..697 (49 sample pts ≈ 48 pt span) |
+
+**No-zoom drifts:** discard −4 pt, preview −2 pt, remind +3 pt
+(all ≤ 4 pt from AX center). iOS hit-test is accurate to within
+±4 pt at the same font under no-zoom; no systematic directional bias.
+
+**End-to-end verification:** after 5b+5c+5d landed, the LLM driver
+(`sibb_assistant.py`, gemini-2.5-flash) passes seed=1 (zoom, font 13 px)
+and seed=3 (no-zoom, font 16 px) in 8 turns each. The probe still shows
+Preview as ghosted in its artificial keep-keyboard-up environment,
+but the agent never needs to tap Preview — that's a distractor.
+
+**Refuted hypotheses** (left in record because they came up in
+analysis):
+
+- "AX-frames are document coords, not screen coords." — WebKit
+  source `WebAccessibilityObjectWrapperIOS.mm` converts AX rects via
+  `convertRectToSpace(rect, AccessibilityConversionSpace::Screen)`,
+  which applies the page-to-screen transform including current zoom.
+  The 29-pt button spacing is therefore the actual on-screen
+  spacing already scaled by zoom factor.
+- "iOS hit-test biases closely-stacked targets toward one direction."
+  — empirical drifts in the no-zoom control are ±4 pt and not
+  directional; refuted.
+
+**Recommendation for any new harness page that stacks tappables**:
+
+- ≥8 px inter-element vertical margin (`margin-top:8px` per form)
+- ≥44 pt × 44 pt button size via inline style or shared CSS rule
+  (Apple HIG; in iOS Safari CSS px and pt are interchangeable at
+  default zoom)
+- Don't assume `<button>` UA default geometry is enough; iOS Safari
+  honors it loosely under zoom, especially for buttons narrower than
+  their neighbors.
+
+**Probe**: `sibb/simulator/sibb_probe_zoom_hit_zone.py [--only zoom|nozoom]`
+— sweeps Y at 4 pt resolution across the stack and reports
+per-button empirical hit zones vs AX frames. Re-run after any
+distractor-rendering change.
+
+### HTML5 form validation tooltip text is invisible to XCUITest (2026-06-07)
+
+**When this bites**: an iOS Safari form with `required` inputs left
+empty, then Submit-tapped, shows the standard HTML5 validation
+balloon ("Please fill out this field") on the offending field. iOS
+makes the balloon's existence visible to assistive technologies but
+exposes the **message text** only via a transient accessibility
+ANNOUNCEMENT (`UIAccessibility.post(notification: .announcement,
+…)`), not via the static AX tree XCUITest reads.
+
+**Verified empirically** with
+`sibb/simulator/sibb_probe_html5_validation_bubble.py` on the
+seed=1 RSVP form (font 13 px → zoom triggered → kb up → empty-fields
+Submit-tap). Captured the FULL raw + scaffold-filtered AX trees at
+0.5 s / 1.2 s / 3.2 s post-tap. Across all 6 captures (5 needle
+searches × multiple element fields):
+
+* The popup IS present as a single AX element:
+  `role=other, label='dismiss popup'` (no `value`, no child text).
+* The message text matches NONE of the needles
+  `{please fill, fill out, required, this field, missing}` in any
+  capture, raw or filtered.
+
+**Consequences for SIBB**:
+
+* Agent can detect "something popped up" (the `dismiss popup`
+  element appears, and the AX tree often duplicates the underlying
+  page content as a second window — both visible signals).
+* Agent CANNOT read which field is empty or what the rule is.
+* `submit_form()` (in `harness_layout.py`) already emits a separate
+  server-rendered `role="alert"` div on the response when an
+  empty-required POST gets through — that's the agent's actual
+  observable signal. The iOS-native popup is decorative for our
+  agents.
+
+**No fix needed at the scaffold layer** — the message text is just
+not exposed by iOS. The in-AX alert div is the canonical channel.
+
+**Open follow-ups**:
+
+* The Swift `zoom_scale` slot is wired into the response envelope
+  but the actual KVC probe of `WKWebView.scrollView.zoomScale` is a
+  placeholder. The Python heuristics are what's load-bearing today.
+  Closing this gap removes the last brittleness in zoom detection.
+* The accessory-bar union still matches English literals
+  (`"Typing Predictions"`, `"Previous"`, etc.). The role+geometry
+  gates above degrade gracefully when iOS localizes the strings
+  (we lose the predictive-bar union but keep the kb-frame guard),
+  but a pure role-based match is the eventual fix.
+
+---
+
+## §22. iOS sim Safari URL-bar does NOT honor `/etc/resolver/test`
+
+**Discovered**: 2026-06-07 while sim-verifying `gen_safari_rsvp_form`
+with `open_at_start=False` (agent has to TYPE the URL rather than
+having it pre-loaded via `simctl openurl`).
+
+**Symptom**: agent types `http://lumen-festival.test:54100/event` in
+Safari's URL bar → Safari classifies it as a search query → loads
+`google.com/search?q=...` instead of the MockSite.
+
+**Root cause**: iOS sim Safari's URL-bar input runs its own DNS
+classification in a path that does NOT read the host's
+`/etc/resolver/test` config. `.test` lookups fail in that path,
+Safari treats unresolvable input as a search query, falls through
+to the default search engine.
+
+**Asymmetry**: `simctl openurl <UDID> <hostname-url>` works fine —
+that path routes through host-side networking which DOES honor
+`/etc/resolver/test`. The HTTP server receives the request with
+`Host: aurora-conference.test:<port>`. The hostname-aware path was
+the only path exercised by the original DNS plumbing work (D6/D7);
+the agent-types-URL path wasn't.
+
+**Empirical verification** (the probe):
+1. Host-side `scripts/sibb_verify_dns_resolver.py` passes all four
+   checks (resolver config + DNS server + macOS resolver + loopback
+   HTTP via hostname).
+2. `simctl openurl <UDID> http://aurora-conference.test:<port>/probe`
+   → MockSite receives a request with `Host: aurora-conference.test:<port>`.
+3. Agent types same URL in URL bar → Safari goes to Google search,
+   MockSite receives nothing.
+
+**Fix (committed Step 5j)**: `gen_safari_rsvp_form` and
+`gen_safari_rsvp_form_clipped` embed `127.0.0.1` (numeric IP) in the
+agent-shown `event_url`. The `hostname` field stays in the
+mock_site spec for logging continuity but is decorative from the
+agent's perspective.
+
+**What we don't fix**: the friendly-hostname realism in the prompt
+when the agent must type. Numeric IP is acceptable because the test
+exercises URL-typing-from-instruction, not URL-from-memory.
+
+**Open question**: is the URL-bar DNS path tunable? Possible
+workarounds for a future hostname-realism upgrade:
+- Pre-load a `<a href="http://team.test:port/event">` page that
+  the agent taps (link navigation likely uses CFNetwork, which
+  honors the host resolver — same code path as `simctl openurl`).
+- Investigate `defaults write` against any sim-side DNS plist.
+
+---
+
+## §23. Safari Saved Credit Cards on iOS 18+ unified with Wallet — sim-blocked
+
+**Discovered**: 2026-06-08 while probing whether SIBB could build a
+`gen_safari_creditcard_autofill_payment_form` task by seeding the
+Safari AutoFill credit-card store host-side (the same trick §13 uses
+for Passwords, where SHA-1 of plaintext is checked into the keychain
+alongside the encrypted blob).
+
+**Verdict**: **NOT FEASIBLE on iOS 26.3 sim. Drop from roadmap.**
+
+**Root cause**: iOS 18+ unified Safari AutoFill credit cards with
+Wallet & Apple Pay. The `Settings → Apps → Safari → AutoFill → Saved
+Credit Cards` row in iOS 26.3 carries the literal on-screen subtitle
+`"Manage cards in Wallet & Apple Pay Settings."` Tapping the row in
+sim bounces back to Settings root — the push to Wallet's panel
+silently fails. The Wallet `+` ("Add Card") triggers the canonical
+`"Could Not Set Up Apple Pay"` alert (same blocker as §15 — no
+Secure Element on sim).
+
+**Empirical evidence** (from
+`sibb/simulator/sibb_probe_safari_autofill_creditcards.py`):
+
+1. Settings → Safari → AutoFill panel is reachable and looks viable.
+2. Tapping "Saved Credit Cards" row → bounces back to Settings root.
+3. Wallet `+` → Apple Pay setup error (same §15 wall).
+4. Host-side seed paths exhausted: SHA-1 hash sweep across every
+   plausible keychain service name (`SafariCreditCard`,
+   `com.apple.Safari.CreditCard`, `WBSCreditCardAutoFill`,
+   `com.apple.creditcards`, …) returns ZERO rows. No
+   `CreditCards.plist`, no `AutoFillCreditCard.*` file, no
+   `com.apple.creditcards` access group on disk. The §13 Passwords
+   trick has no analog for credit cards.
+5. With an empty store, Safari's AutoFill chip above the keyboard
+   never surfaces on a page with `<input autocomplete="cc-number">`
+   (only the default `Previous / Next / Done` accessory bar shows).
+   Empirically verified with a host-served numeric IP form.
+
+**Probe artifacts** kept at `/tmp/sibb_cc_probe/` (screenshots, AX
+JSON dumps, summary.json) and the reusable probe script lives at
+`sibb/simulator/sibb_probe_safari_autofill_creditcards.py`
+(`--step settings|add_card|inspect_kc|serve_form|all`). Re-run if a
+future iOS version separates the AutoFill store from Wallet — that
+would re-open the door.
+
+**Implication for benchmark design**: payment forms in SIBB shop
+tasks must use the same typed-field RSVP-style pattern. No
+AutoFill-chip variation possible on sim. Cross-app "fetch the card
+from somewhere else" patterns can still work via Files / Contacts
+notes / a separate `/account/cards` page on the MockSite — those
+don't depend on the iOS AutoFill subsystem.
+
+**Reference**: `sibb_runs/safari_creditcards_autofill_probe.md` (full
+1570-word report with sources). Cross-link from `§15` (Wallet /
+Apple Pay) since the architectural unification ties these two walls
+together.
 
 ---
 

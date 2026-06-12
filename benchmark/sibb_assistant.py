@@ -108,15 +108,63 @@ Some wheels CYCLE (month, day, hour) — scrolling past the end wraps.
 Others have ENDS (year, with "----" as a year-not-set sentinel) —
 scrolling past the end does nothing.
 
-The header above the list shows the current app and keyboard state, e.g.
-"step 3   app=reminders   els=42   kb=False".
+The header above the list shows the current app, element count, and
+keyboard state. Two optional tags may appear after `kb=`:
+
+  ── step 3   app=reminders   els=42   kb=False ──
+
+  ── step 7   app=mobilesafari   els=18   kb=True   LANDSCAPE   AUTO-ZOOMED=1.50x(swift) ──
+
+`LANDSCAPE` means the device is rotated; coordinate origin is still
+top-left but width > height. `AUTO-ZOOMED=<factor>x(<source>)` means
+iOS Safari auto-zoomed on an input focus. AX element coords are
+STILL real screen coords — TAP at the reported coords hits — but
+some content may extend off the right edge; SCROLL_PAGE right to
+reach it. To RESET the zoom, use `DOUBLE_TAP (x, y)` on a non-input
+page region (heading, empty area, body text) — fires WebKit's
+zoom-to-fit recognizer. `PINCH out` does NOT work on Safari WebView.
+
+The `(source)` part identifies how we detected the zoom and is
+informational only:
+  swift            — WKWebView's UIScrollView zoomScale (authoritative)
+  kb_above_screen  — keyboard frame reported above screen height
 
 == ACTION GRAMMAR ==
 
 Tap / type / scroll:
   TAP @e042                  tap element by ref
-  TAP "Add Alarm"            tap element by label substring (case-sensitive)
+  TAP "Add Alarm"            tap element by label substring (case-insensitive)
   TAP (200, 400)             raw-coordinate tap (no AX lookup) — use sparingly
+  DOUBLE_TAP (200, 100)      coordinate double-tap. PRIMARY USE: reset
+                             Safari's auto-zoom — after focusing a form
+                             input, Safari zooms in and stays zoomed
+                             even after the kb dismisses. Double-tap on
+                             a non-input page region (the top quarter
+                             of the viewport, e.g. (200, 100), is
+                             almost always heading / page chrome / safe)
+                             fires WebKit's zoom-to-fit recognizer and
+                             returns the page to baseline scale. This
+                             is the ONLY reliable reset — PINCH and
+                             PRESS home do NOT work on Safari WebView.
+                             FOR ZOOM RESET USE COORDS, not @ref —
+                             @ref on a heading/link risks triggering
+                             selection or activation instead of zoom-
+                             fit. @ref / "label" forms accepted for
+                             non-Safari double-tap (Maps zoom-in, etc).
+
+                             Canonical Safari recovery sequence:
+                               TAP @<input>                # focus input → auto-zoom in
+                               TYPE @<input> "..."         # fill it
+                               TAP @<accessory_done>       # kb dismisses, page STILL zoomed
+                               DOUBLE_TAP (200, 100)       # zoom-to-fit
+                               # now AUTO-ZOOMED tag is gone; continue normally
+
+                             Note on refs: every @ref (including the
+                             accessory bar's Done/Next/Previous) is
+                             VALID ONLY for the snapshot it came from.
+                             Re-observe before reusing a ref across
+                             turns. The bar's refs in particular roll
+                             over when focus moves between fields.
   TYPE @e017 "Hello world"   tap-to-focus then type into a text field.
                              NOTE: TYPE APPENDS to the current value;
                              it does NOT replace. `TYPE @e017 ""` is a
@@ -145,14 +193,15 @@ Tap / type / scroll:
                              side). Pair with TYPE to replace text:
                                CLEAR @e017
                                TYPE @e017 "new value"
-  SCROLL down 2              whole-screen scroll (no element targeting).
-                             For picker wheels, the @ref form is REQUIRED —
-                             bare SCROLL moves the whole screen, not the
-                             wheel underneath.
-  SCROLL @e033 down 5        element-bounded scroll — PRECISE mode
-                             (on picker wheels: ~1 tick per swipe;
-                              on regular scroll views: ~one row per swipe).
+  SCROLL @e033 down 5        REQUIRES @ref — pans a SCROLLABLE element
+                             (a UIScrollView / table / collection /
+                             WebView etc., usually shown with role
+                             [scroll], [table], [collection], or [web]).
+                             On picker wheels: ~1 tick per swipe;
+                             on regular scroll views: ~one row per swipe.
                              MAX amount: 20 swipes/turn.
+                             Bare `SCROLL down` (no @ref) is REJECTED —
+                             use SWIPE for whole-screen gestures.
   FLING @e033 down 1         element-bounded FLING — FAST mode
                              (on picker wheels: ~20-30 ticks per fling;
                               on scroll views: ~screen-height per fling).
@@ -160,14 +209,81 @@ Tap / type / scroll:
                              Use SCROLL for fine targeting (last 1-20
                              ticks); use FLING to close big gaps quickly.
                              Requires @ref — no whole-screen FLING.
-  SWIPE left                 whole-screen swipe gesture
-  SWIPE @e033 left           element-bounded swipe
+  ★ DIRECTION SEMANTICS — read this BEFORE picking SWIPE vs SCROLL_PAGE.
+    SWIPE's `direction` is the FINGER direction. SWIPE down = finger
+    moves DOWN = content follows the finger DOWN = the page actually
+    scrolls UP (you see HIGHER content). This trips up agents who
+    think "I want to scroll down, so I'll SWIPE down." It's wrong.
+    If you mean "show me lower content," use SCROLL_PAGE down — it
+    takes CONTENT direction and emits the iOS-correct finger gesture.
+
+    Decision table:
+      "see lower / higher content"        → SCROLL_PAGE down / up
+      "see content to the right / left"   → SCROLL_PAGE right / left
+      "open app switcher / Control Center / Spotlight" → SWIPE up / down
+      "page-flip on Springboard"          → SWIPE left / right
+      "scroll inside this list/web/picker" → SCROLL @ref
+
+  SCROLL_PAGE down           CONTENT-DIRECTION whole-page scroll.
+                             SCROLL_PAGE down → see lower content (= SWIPE up)
+                             SCROLL_PAGE up   → see higher content
+                             SCROLL_PAGE right → see content to right
+                             SCROLL_PAGE left  → see content to left
+                             Optional repeat count: SCROLL_PAGE down 3.
+                             Use this when you want to reveal off-screen
+                             content on a page that doesn't expose a
+                             scrollable @ref (e.g. a Safari WebView
+                             where the agent only sees inputs / buttons).
+                             Internally a synonym for SWIPE with the
+                             direction flipped.
+  SWIPE up                   whole-screen FINGER-DIRECTION gesture, for
+                             SYSTEM surfaces only:
+                             SWIPE up (from bottom) → app switcher
+                             SWIPE down (from top) → Control Center
+                             SWIPE down (from mid) → Spotlight
+                             SWIPE left/right (Springboard) → page flip
+                             For PAGE CONTENT use SCROLL_PAGE instead.
+  SWIPE @e033 left           element-bounded swipe (finger direction)
+  PINCH out                  two-finger zoom-OUT gesture (scale 0.5x).
+                             Useful on Maps / Photos / image viewers.
+                             Does NOT reset Safari WebView zoom — use
+                             DOUBLE_TAP for that.
+  PINCH in                   two-finger zoom-IN gesture (scale 2.0x).
+                             Use for Maps / Photos when you need to
+                             zoom into content.
+  PINCH 0.6                  explicit scale (any 0-100 float).
   ADJUST @e044 up 3          (deprecated; use SCROLL @ref or FLING @ref)
+
+Header tags:
+  LANDSCAPE                  the device is rotated to landscape. Most
+                             generators were authored against portrait;
+                             layouts will look different.
+  AUTO-ZOOMED=1.5x(swift)    Safari has auto-zoomed (scale + detection
+                             source shown). AX coords are still REAL
+                             screen coords — TAPs hit. Some content
+                             may extend past the right edge; SCROLL
+                             horizontally to reach it.
 
 Hardware buttons:
   PRESS home                 exit to home screen
   PRESS back                 left-edge in-app back gesture
   PRESS app_switcher         recent-apps carousel
+
+Keyboard:
+  RETURN                     fire the Return key into the currently
+                             keyboard-focused element. iOS dispatches it
+                             against the focused field's configuration,
+                             so the same verb covers `Go` / `Search` /
+                             `Done` / `Next` / plain `Return`. PRIMARY
+                             USE: commit a typed URL in Safari's URL bar
+                             (the keyboard's Return/Go key is NOT in the
+                             AX tree, and tapping a dropdown suggestion
+                             submits as a SEARCH — not navigation).
+                             Also commits in-app search bars, "name
+                             this" dialogs, and web forms (Return on
+                             the last field submits the default form
+                             action). Argless — operates on whatever
+                             input has keyboard focus.
 
 Waiting for async UI:
   OBSERVE                    no-op — just re-observe on the next turn.
@@ -322,7 +438,9 @@ How to find an app:
       wrong app.
    Always prefer the `[cell]` results. If the app you want is NOT in
    the visible suggestions list, the list is alphabetical and
-   truncated — SCROLL down inside the results to reveal more cells.
+   truncated — find the surrounding `[scroll]`/`[table]`/`[collection]`
+   element in the observation and `SCROLL @<that-ref> down` to reveal
+   more cells.
 
 2. **Swipe between pages.** If Spotlight isn't an option:
        SWIPE left     advance to the next home-screen page
@@ -390,11 +508,14 @@ If you opened the wrong app, PRESS home to return, then try again.
 == iOS QUIRKS ==
 
 - The keyboard often covers the bottom of the screen; you may need to
-  scroll a list — or scroll the FORM you're editing — before its lower
-  entries become tappable. The scaffold filters out elements fully
-  hidden behind the keyboard, so if a form field you expected isn't in
-  the observation while typing, SCROLL the form up to bring it above
-  the keyboard.
+  pan the underlying scrollable container — a `[scroll]`, `[table]`,
+  `[collection]`, or sometimes the surrounding `[web]`/form — before
+  the lower entries become tappable. The scaffold filters out elements
+  fully hidden behind the keyboard, so if a field you expected isn't
+  in the observation while typing, find the enclosing scrollable
+  element in the observation and `SCROLL @<that-ref> down` to bring
+  more of the form into view. Bare `SCROLL down` (no @ref) errors —
+  use SWIPE only for whole-screen system gestures.
 - Modal sheets dismiss by tapping outside, dragging the grabber down,
   or tapping a "Cancel"/"Done" button — there is no PRESS back from
   inside a sheet.
@@ -444,9 +565,70 @@ def fmt_observation(tree: AXTree, tokenizer: AXTokenizer, step: int,
     bid  = getattr(tree, "bundle_id", "?") or "?"
     bid_short = bid.split(".")[-1]
     n    = len(tree.elements)
-    header = (f"── step {step}   app={bid_short}   els={n}   "
-              f"kb={kb} ──")
+    zoom = getattr(tree, "coord_system_zoomed", False)
+    orientation = getattr(tree, "orientation", "portrait")
+    # Tag landscape since most generators were authored against
+    # portrait — surfaces a hint when AX layout will look unfamiliar.
+    parts = [f"── step {step}", f"app={bid_short}",
+              f"els={n}", f"kb={kb}"]
+    if orientation == "landscape":
+        parts.append("LANDSCAPE")
+    if zoom:
+        zf = getattr(tree, "zoom_factor", None)
+        zs = getattr(tree, "zoom_source", None)
+        suffix = ""
+        if zf is not None:
+            suffix = f"={zf:.2f}x"
+        if zs:
+            suffix += f"({zs})"
+        parts.append(f"AUTO-ZOOMED{suffix}")
+    header = "   ".join(parts) + " ──"
+    if zoom:
+        header += (
+            "\n# Safari auto-zoomed on input focus. AX coords for form "
+            "elements are still REAL screen coords — TAP at the "
+            "reported coords still hits. RESET the zoom with "
+            "`DOUBLE_TAP (x, y)` on a non-input region — the top "
+            "quarter of the viewport (e.g. (200, 100)) is almost "
+            "always page chrome or heading, safe to double-tap. "
+            "PINCH out does NOT reset Safari WebView zoom; don't "
+            "bother trying it here. Do the reset BEFORE continuing "
+            "the task — content off the right edge stays unreachable "
+            "while zoomed."
+        )
     return header + "\n" + flat
+
+
+def _tree_diagnostics(tree: AXTree) -> dict:
+    """Structured snapshot of AX-pipeline state for this observation.
+
+    Logged into the per-turn JSONL alongside the observation text so
+    post-hoc analysis ("when did a zoom signal fire?", "how many
+    elements got kb-occluded?") doesn't have to re-parse the
+    human-readable header. Each field is the corresponding attribute
+    set on `tree` by `AXReader._read_xcuitest` — see `sibb_scaffold.py`
+    for the source-of-truth definitions. None values when an older
+    SIBBHelper build or non-Safari context didn't surface the signal.
+    """
+    return {
+        "ax_backend": getattr(tree, "ax_backend", None),
+        "orientation": getattr(tree, "orientation", None),
+        "coord_system_zoomed": getattr(tree, "coord_system_zoomed", None),
+        "zoom_factor": getattr(tree, "zoom_factor", None),
+        "zoom_source": getattr(tree, "zoom_source", None),
+        "keyboard_visible": getattr(tree, "keyboard_visible", None),
+        "keyboard_y_min": getattr(tree, "keyboard_y_min", None),
+        # Accessory bar (informational only as of 2026-06-06 — used to
+        # be unioned into keyboard_y_min, no longer is).
+        "accessory_bar_frame": getattr(tree, "accessory_bar_frame", None),
+        "top_chrome_bottom": getattr(tree, "top_chrome_bottom", None),
+        "bottom_chrome_top": getattr(tree, "bottom_chrome_top", None),
+        "kb_filtered_count": getattr(tree, "kb_filtered_count", None),
+        "viewport_filtered_count": getattr(
+            tree, "viewport_filtered_count", None),
+        "screen_width": getattr(tree, "screen_width", None),
+        "screen_height": getattr(tree, "screen_height", None),
+    }
 
 
 class TurnLog:
@@ -486,7 +668,16 @@ async def run_episode(args) -> int:
     llm = make_client(args.provider, model=args.model,
                       timeout=args.llm_timeout)
 
-    reader    = AXReader(args.udid)
+    # Reader: either own one (default — UI batch isn't there yet) or
+    # reuse one injected by a batch runner. The injected path mirrors
+    # the API baseline (sibb_api_assistant.py); a batch runner that
+    # boots the sim + XCUITest once and shares the reader across many
+    # episodes avoids the per-episode ~25s boot cost and the
+    # documented sim flakiness on repeated XCUITest server cycling
+    # (Maestro #3254, WDA #507).
+    inject_reader = getattr(args, "inject_reader", None)
+    owned_reader = inject_reader is None
+    reader = inject_reader if not owned_reader else AXReader(args.udid)
     tokenizer = AXTokenizer()
     enricher  = AXEnricher(vlm_client=None)
     parser_helper = SIBBScaffold(args.udid)
@@ -509,29 +700,33 @@ async def run_episode(args) -> int:
     })
     print(f"{B}Log:{R}         {log_path}")
 
-    # Pre-runner setup (sim-shutdown-required plist edits — Springboard
-    # layout/dock). No-op if the task has no such entries.
-    pre_report = apply_pre_runner_setup(args.udid, task)
-    if pre_report.get("applied"):
-        print(f"\n{B}Pre-runner setup applied:{R}")
-        for e in pre_report["applied"]:
-            print(f"  {e}")
-    if pre_report.get("errors"):
-        print(f"\n{RE}{B}Pre-runner setup FAILED:{R}")
-        for e in pre_report["errors"]:
-            print(f"  {RE}✗ {e}{R}")
-        log.append({"type": "abort", "reason": "pre_runner_failed",
-                    "errors": pre_report["errors"]})
-        log.close()
-        return 1
+    if owned_reader:
+        # Pre-runner setup (sim-shutdown-required plist edits —
+        # Springboard layout/dock). No-op if the task has no such
+        # entries. Skipped on the injected path: the batch runner
+        # owns sim lifecycle and cannot afford a shutdown between
+        # episodes (kills the shared XCUITest runner).
+        pre_report = apply_pre_runner_setup(args.udid, task)
+        if pre_report.get("applied"):
+            print(f"\n{B}Pre-runner setup applied:{R}")
+            for e in pre_report["applied"]:
+                print(f"  {e}")
+        if pre_report.get("errors"):
+            print(f"\n{RE}{B}Pre-runner setup FAILED:{R}")
+            for e in pre_report["errors"]:
+                print(f"  {RE}✗ {e}{R}")
+            log.append({"type": "abort", "reason": "pre_runner_failed",
+                        "errors": pre_report["errors"]})
+            log.close()
+            return 1
 
-    import subprocess as _sp
-    _sp.run(["open", "-a", "Simulator",
-             "--args", "-CurrentDeviceUDID", args.udid],
-            capture_output=True)
-    await asyncio.sleep(2)
+        import subprocess as _sp
+        _sp.run(["open", "-a", "Simulator",
+                 "--args", "-CurrentDeviceUDID", args.udid],
+                capture_output=True)
+        await asyncio.sleep(2)
 
-    await reader.start(bundle_id=args.bundle)
+        await reader.start(bundle_id=args.bundle)
     exit_code = 0
     try:
         # Apply initial state via the connected XCUITest reader.
@@ -681,6 +876,7 @@ async def run_episode(args) -> int:
                 "output_tokens": llm_resp.output_tokens,
                 "stop_reason": llm_resp.stop_reason,
                 "llm_ms": llm_ms,
+                "diagnostics": _tree_diagnostics(tree),
             })
 
             action = parser_helper.parse_action(llm_text)
@@ -699,6 +895,11 @@ async def run_episode(args) -> int:
                 "type": "action",
                 "step": step,
                 "action_type": action.action_type,
+                # `raw_verb` carries the literal verb the agent emitted
+                # before any aliasing — `SCROLL_PAGE down` dispatches as
+                # action_type=swipe with direction inverted; without
+                # raw_verb the log can't distinguish it from a real SWIPE.
+                "raw_verb": action.raw_verb,
                 "target_ref": action.target_ref,
                 "target_label": action.target_label,
                 "text": action.text,
@@ -776,6 +977,47 @@ async def run_episode(args) -> int:
         print(f"\n  {color}{icon} Episode result: agent {agent_claim}; "
               f"verifier before={passed_before} after={passed_after}{R}")
 
+        # If verifier failed AND any MockSite fixtures are alive, dump
+        # their HTTP traffic. This is the answer to "did the agent's
+        # tap actually fire a POST?" — invaluable when an iOS Safari
+        # tap quirk silently doesn't submit a form.
+        if not passed_after:
+            try:
+                from sibb_mock_site import list_sites, get_site
+                ids = list_sites()
+                if ids:
+                    print(f"\n  {YE}── MockSite traffic dump "
+                          f"(verifier failed, {len(ids)} site(s) alive) ─{R}")
+                    for sid in ids:
+                        s = get_site(sid)
+                        if s is None:
+                            continue
+                        reqs = s.request_log()
+                        subs = s.submissions(include_decoys=True)
+                        print(f"    site_id={sid}")
+                        print(f"      requests ({len(reqs)}):")
+                        for r in reqs[-20:]:  # last 20 to keep tidy
+                            # Coerce to str — any field may be None when
+                            # iOS sends a malformed request and we log
+                            # before headers parse.
+                            method = str(r.get("method") or "")
+                            path = str(r.get("path") or "")
+                            code = r.get("response_code") or 0
+                            ctype = r.get("content_type") or "-"
+                            print(f"        {method:5s} "
+                                  f"{path:30s} "
+                                  f"→ {code} ({ctype})")
+                        print(f"      submissions ({len(subs)}):")
+                        for s_ in subs[-10:]:
+                            decoy = " [decoy]" if s_.get(
+                                "is_decoy") else ""
+                            mode = s_.get("mode") or s_.get("path") or ""
+                            fields = s_.get("fields")
+                            print(f"        mode={mode}{decoy} "
+                                  f"fields={fields}")
+            except Exception as _dump_err:  # pragma: no cover
+                print(f"  (mock-site dump skipped: {_dump_err!r})")
+
         log.append({
             "type": "verify_after",
             "passed": passed_after,
@@ -789,7 +1031,10 @@ async def run_episode(args) -> int:
         # shell scripts gate on success).
         exit_code = 0 if delta else 1
     finally:
-        await reader.stop()
+        # Only stop the reader if we own it. On the injected path the
+        # batch runner keeps the reader alive across episodes.
+        if owned_reader:
+            await reader.stop()
         log.close()
 
     return exit_code

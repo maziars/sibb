@@ -207,10 +207,19 @@ def test_get_unknown_path_returns_404(site):
     assert ei.value.code == 404
 
 
-def test_post_unknown_path_returns_404(site):
-    with pytest.raises(urllib.error.HTTPError) as ei:
-        _post(f"{site.base_url}/does-not-exist", {"x": "1"})
-    assert ei.value.code == 404
+def test_post_to_non_credential_path_captured_as_generic_submission(site):
+    """Behavior change (2026-06-05): POSTs to arbitrary paths now land
+    in `submissions` as generic entries with `mode=<path>` so harness
+    generators can submit `/rsvp` / `/buy` / `/contact` forms without
+    declaring those paths up front. (Previously this returned 404.)"""
+    resp = _post(f"{site.base_url}/does-not-exist", {"x": "1"})
+    assert resp.status == 200
+    body = resp.read().decode().lower()
+    assert "submitted" in body
+    rsvp = [s for s in site.submissions()
+            if s.get("mode") == "/does-not-exist"]
+    assert len(rsvp) == 1
+    assert rsvp[0]["fields"]["x"] == "1"
 
 
 # ─────────────────────────── signin flow ──────────────────────────────
@@ -459,6 +468,144 @@ def test_mock_site_visited_unknown_site_id_raises():
     fetcher = RESOURCE_FETCHERS["mock_site.visited"]
     with pytest.raises(ResourceFetchError, match="no mock site"):
         asyncio.run(fetcher(None, {"site_id": "nonexistent-xyz"}))
+
+
+# ─────────────────── P1/P2 follow-up (2026-06-03) ─────────────────────
+
+
+def test_visits_records_user_agent_shape(site):
+    """The visits log records the User-Agent header. For verifiers
+    that want to distinguish Safari-real vs probe-harness traffic
+    by UA, the field must be non-empty for a typical urllib client.
+    """
+    _get(site.login_url)
+    visits = site.visits()
+    assert len(visits) == 1
+    ua = visits[0].get("user_agent")
+    assert isinstance(ua, str)
+    assert ua, "user_agent should not be empty for a default urllib client"
+
+
+def test_mock_site_visited_latest_composes_with_path_filter(site):
+    """`latest` returns the most-recent row AFTER all other filters
+    apply. Combining `path="/login"` with `latest=True` returns the
+    most recent /login visit only, ignoring /other visits in between."""
+    import asyncio
+    import time
+    from sibb_verify import RESOURCE_FETCHERS
+    _get(site.login_url)
+    time.sleep(0.01)
+    try:
+        _get(f"{site.base_url}/other-path")
+    except urllib.error.HTTPError:
+        pass
+    time.sleep(0.01)
+    _get(site.login_url)  # third visit, second /login
+
+    fetcher = RESOURCE_FETCHERS["mock_site.visited"]
+    rows = asyncio.run(fetcher(None, {
+        "site_id": site.site_id,
+        "path": site.sign_in_path,
+        "latest": True,
+    }))
+    assert len(rows) == 1
+    assert rows[0]["path"] == site.sign_in_path
+    # All three visits exist; latest+path picked the most-recent
+    # MATCHING path, not the most-recent overall (which would be /login
+    # but only because that's the 3rd visit — assert it's specifically
+    # the 3rd visit's epoch, the largest).
+    all_login = [v for v in site.visits()
+                 if v["path"] == site.sign_in_path]
+    assert rows[0]["epoch"] == max(v["epoch"] for v in all_login)
+
+
+def test_visits_zero_match_count_check():
+    """`count(path=X) == 0` is the canonical "agent did not navigate
+    to X" idiom. Verify the fetcher returns an empty list when the
+    path was never visited, which a count check turns into 0."""
+    import asyncio
+    s = MockSite(site_id=f"test-{uuid.uuid4().hex[:8]}")
+    s.start()
+    try:
+        # Visit /login but not /elsewhere.
+        _get(s.login_url)
+        from sibb_verify import RESOURCE_FETCHERS
+        fetcher = RESOURCE_FETCHERS["mock_site.visited"]
+        rows = asyncio.run(fetcher(None, {"site_id": s.site_id,
+                                            "path": "/elsewhere"}))
+        assert rows == []
+    finally:
+        s.stop()
+
+
+def test_mock_site_visited_multi_site_disambiguation():
+    """Two MockSites with different site_ids. Visit only site A; the
+    fetcher for B returns an empty list (NOT site A's visits)."""
+    import asyncio
+    site_a_id = f"test-A-{uuid.uuid4().hex[:8]}"
+    site_b_id = f"test-B-{uuid.uuid4().hex[:8]}"
+    a = MockSite(site_id=site_a_id)
+    b = MockSite(site_id=site_b_id)
+    a.start()
+    b.start()
+    try:
+        _get(a.login_url)
+        from sibb_verify import RESOURCE_FETCHERS
+        fetcher = RESOURCE_FETCHERS["mock_site.visited"]
+        rows_a = asyncio.run(fetcher(None, {"site_id": site_a_id}))
+        rows_b = asyncio.run(fetcher(None, {"site_id": site_b_id}))
+        assert len(rows_a) == 1
+        assert rows_b == []
+    finally:
+        a.stop()
+        b.stop()
+
+
+def test_visits_concurrent_no_lost_records(site):
+    """50 threads × 1 GET each must produce exactly 50 recorded visits
+    (no race lost a record). Lock contention sanity for the visits
+    log — if `with site._lock:` is removed, threads can drop visits."""
+    import threading
+    NUM_THREADS = 50
+
+    def _hit():
+        try:
+            _get(site.login_url)
+        except Exception:
+            pass
+
+    threads = [threading.Thread(target=_hit) for _ in range(NUM_THREADS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert len(site.visits()) == NUM_THREADS
+
+
+def test_visits_records_count_check_via_verifier_idiom():
+    """End-to-end style: visit /login twice, /other once. Use the
+    count check kind with selectors to assert exactly 2 hits to
+    /login. This is the canonical verifier idiom for reverse-direction
+    generators (Calendar.url → Safari etc.)."""
+    import asyncio
+    s = MockSite(site_id=f"test-{uuid.uuid4().hex[:8]}")
+    s.start()
+    try:
+        _get(s.login_url)
+        _get(s.login_url)
+        try:
+            _get(f"{s.base_url}/other")
+        except urllib.error.HTTPError:
+            pass
+        from sibb_verify import RESOURCE_FETCHERS
+        fetcher = RESOURCE_FETCHERS["mock_site.visited"]
+        rows = asyncio.run(fetcher(None, {"site_id": s.site_id,
+                                            "path": s.sign_in_path}))
+        # count check kind would assert len(rows) == 2.
+        assert len(rows) == 2
+    finally:
+        s.stop()
 
 
 # ─────────────────────────── /status JSON ─────────────────────────────

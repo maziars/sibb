@@ -610,7 +610,7 @@ class XCUITestReader:
             if not resp.get("ok"):
                 raise RuntimeError(f"Observe failed: {resp.get('error')}")
             elements = [AXElement(e) for e in resp.get("elements", [])]
-            return AXTree(
+            tree = AXTree(
                 elements,
                 self.udid,
                 keyboard_visible=resp.get("keyboard_visible", False),
@@ -620,6 +620,13 @@ class XCUITestReader:
                 bundle_id=resp.get("bundle_id", "") or (bundle or ""),
                 keyboard_frame=resp.get("keyboard_frame"),
             )
+            # Fields added 2026-06-05 — gracefully default to None so
+            # this client still works against an unbuilt SIBBHelper
+            # (Swift may not emit zoom_scale / accessory_bar_frame yet).
+            # See sibb_scaffold._read_xcuitest for consumers.
+            tree.zoom_scale = resp.get("zoom_scale")
+            tree.accessory_bar_frame = resp.get("accessory_bar_frame")
+            return tree
 
     async def tap(self, x: float = None, y: float = None, ref: str = None):
         """Tap by coordinate or element identifier."""
@@ -631,6 +638,26 @@ class XCUITestReader:
             resp = await self._send(cmd)
             if not resp.get("ok"):
                 raise RuntimeError(f"Tap failed: {resp.get('error')}")
+
+    async def double_tap(self, x: float = None, y: float = None,
+                          ref: str = None):
+        """Double-tap by coordinate or element identifier. Dispatches
+        through `XCUICoordinate.doubleTap()` (native gesture path).
+
+        Primary use: reset Safari's WKWebView auto-zoom — `xc.tap()`
+        twice in succession does NOT fire WebKit's double-tap-to-zoom
+        recognizer, but this native API does. Verified empirically
+        (see IOS_SIM_QUIRKS §21).
+        """
+        async with self._lock:
+            cmd = {"type": "double_tap"}
+            if x is not None: cmd["x"] = x
+            if y is not None: cmd["y"] = y
+            if ref:           cmd["ref"] = ref
+            resp = await self._send(cmd)
+            if not resp.get("ok"):
+                raise RuntimeError(
+                    f"double_tap failed: {resp.get('error')}")
 
     async def type_text(self, text: str):
         async with self._lock:
@@ -757,6 +784,34 @@ class XCUITestReader:
             if not resp.get("ok"):
                 raise RuntimeError(f"Press failed: {resp.get('error')}")
 
+    async def pinch(self, scale: float = 0.5,
+                     velocity: float = 1.0) -> Dict[str, Any]:
+        """Two-finger pinch gesture on the whole-app frame.
+
+        Args:
+            scale: pinch factor. >1 zooms IN, <1 zooms OUT. Default 0.5
+                   (zoom out by half — the canonical Safari auto-zoom
+                   recovery).
+            velocity: gesture speed in scale-per-second. Default 1.0
+                      (matches Apple's documented sane default).
+
+        Primary motivation: iOS Safari auto-zooms when focusing an
+        input whose `font-size < 16px`. The page can stay zoomed even
+        after the agent dismisses the keyboard or leaves the app.
+        `PINCH out` is the only reliable reset confirmed empirically
+        on iOS 26 sim (TAP URL bar, PRESS home, app-switcher trips —
+        all observed not to reset the WebView's stuck zoom).
+        """
+        async with self._lock:
+            resp = await self._send({
+                "type": "pinch",
+                "scale": float(scale),
+                "velocity": float(velocity),
+            })
+            if not resp.get("ok"):
+                raise RuntimeError(f"Pinch failed: {resp.get('error')}")
+            return resp
+
     async def launch(self, bundle_id: str = None):
         async with self._lock:
             resp = await self._send({
@@ -803,8 +858,17 @@ class XCUITestReader:
                 # Skip non-JSON lines
                 continue
             try:
+                # Per-command socket-recv budget. 60s was the original
+                # value; tightened to 30s on 2026-06-11 because the
+                # only commands that legitimately take >30s are batched
+                # ones (e.g. CLEAR with many backspaces) and even those
+                # rarely cross 20s. Empirically the >30s cases were
+                # iOS Calendar / Safari tapping into a heavy view that
+                # hung the synthetic-touch system — failing fast lets
+                # the runner-level healthcheck + recycle pattern
+                # recover ~30s sooner per fault.
                 chunk = await asyncio.wait_for(
-                    loop.sock_recv(self._sock, 65536), timeout=60.0
+                    loop.sock_recv(self._sock, 65536), timeout=30.0
                 )
                 if not chunk:
                     raise RuntimeError("Socket closed by server.")

@@ -22,6 +22,7 @@ Incorporates all design changes from the full research discussion:
 
 import datetime as _dt
 import random
+import uuid
 import json
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Dict, Tuple
@@ -4174,6 +4175,26 @@ def _iso_time(d, hour: int, minute: int = 0) -> str:
     return f"{d.isoformat()}T{hour:02d}:{minute:02d}:00"
 
 
+def _day_reference(d) -> str:
+    """Natural-language reference to a date.
+
+    Returns "tomorrow" when d is exactly tomorrow (the most natural
+    phrasing), otherwise the explicit weekday + month + day (e.g.
+    "on Thursday July 09"). The caller embeds this verbatim:
+
+        f"Schedule '{title}' {_day_reference(d)} at {nice_time}."
+
+    This keeps the spread defended by _calendar_anchor_date intact —
+    the anchor still ranges over [today+1, today+30] — while letting
+    the prose use "tomorrow" when that's actually accurate. Resolves
+    the 2026-06-11 "prose-says-tomorrow-but-anchor-is-random" bug
+    that v3b sim run surfaced once the agent had a working clock."""
+    days = (d - _dt.date.today()).days
+    if days == 1:
+        return "tomorrow"
+    return f"on {d.strftime('%A %B %d')}"
+
+
 def _pick_meeting_slots(d, n: int) -> List[Tuple[int, int]]:
     """Pick `n` distinct (start_hour, duration_min) slots on date `d`
     that don't overlap. Used to seed corpora of timed events with
@@ -4509,12 +4530,14 @@ def gen_create_event_with_title_time():
 
     nice_time = f"{hour % 12 or 12}{'pm' if hour >= 12 else 'am'}"
     end_nice  = f"{end_h % 12 or 12}:{end_m:02d}{'pm' if end_h >= 12 else 'am'}"
+    # 2026-06-11: prose-vs-anchor mismatch fix (see _day_reference).
+    when = _day_reference(d)  # "tomorrow" if d==today+1, else "on <date>"
     instruction = random.choice([
-        f"Open Calendar. Create an event titled '{title}' tomorrow from "
-        f"{nice_time} to {end_nice}.",
-        f"Open Calendar. Add a {dur}-minute event tomorrow at {nice_time} "
-        f"called '{title}'.",
-        f"Open Calendar. Schedule '{title}' for tomorrow at {nice_time}.",
+        f"Open Calendar. Create an event titled '{title}' {when} "
+        f"from {nice_time} to {end_nice}.",
+        f"Open Calendar. Add a {dur}-minute event {when} at "
+        f"{nice_time} called '{title}'.",
+        f"Open Calendar. Schedule '{title}' {when} at {nice_time}.",
     ])
 
     verify_checks = [
@@ -4889,12 +4912,12 @@ def gen_change_event_time():
     new_end = _iso_time(d, new_end_h, new_end_m)
 
     new_nice = f"{new_hour % 12 or 12}{'pm' if new_hour >= 12 else 'am'}"
-    # All three phrasings anchor to "tomorrow" so the agent isn't penalized
-    # for a legitimate ambiguity (every baseline event IS on tomorrow).
+    # 2026-06-11: prose-vs-anchor mismatch fix (see _day_reference).
+    when = _day_reference(d)  # "tomorrow" if d==today+1, else "on <date>"
     instruction = random.choice([
-        f"Open Calendar. Move '{target}' to start at {new_nice} tomorrow.",
-        f"Open Calendar. Reschedule tomorrow's '{target}' to {new_nice}.",
-        f"Open Calendar. '{target}' tomorrow needs to move — {new_nice} "
+        f"Open Calendar. Move '{target}' to start at {new_nice} {when}.",
+        f"Open Calendar. Reschedule the '{target}' {when} to {new_nice}.",
+        f"Open Calendar. '{target}' {when} needs to move — {new_nice} "
         f"works better.",
     ])
 
@@ -6670,14 +6693,16 @@ def gen_create_recurring_event():
 
     nice_time = f"{hour % 12 or 12}{'pm' if hour >= 12 else 'am'}"
     end_nice  = f"{end_h % 12 or 12}:{end_m:02d}{'pm' if end_h >= 12 else 'am'}"
+    # 2026-06-11: prose-vs-anchor mismatch fix (see _day_reference).
+    when = _day_reference(d)  # "tomorrow" if d==today+1, else "on <date>"
     instruction = random.choice([
         f"Open Calendar. Create a weekly event titled '{title}' "
-        f"starting tomorrow at {nice_time} (ending at {end_nice}), "
+        f"starting {when} at {nice_time} (ending at {end_nice}), "
         f"repeating {end_count} times.",
         f"Open Calendar. Add '{title}' as a weekly series of "
-        f"{end_count} starting tomorrow at {nice_time} ({dur}-minute).",
+        f"{end_count} starting {when} at {nice_time} ({dur}-minute).",
         f"Open Calendar. Schedule '{title}' weekly for {end_count} "
-        f"occurrences, starting tomorrow {nice_time} to {end_nice}.",
+        f"occurrences, starting {when} {nice_time} to {end_nice}.",
     ])
 
     verify_checks = [
@@ -9418,6 +9443,1107 @@ def gen_message_save_address():
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Safari single-app generators (Phase 4 / Tier 1, 2026-06-05)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Tier-0 infra all in place (commits 793eaa9..fad4d82):
+#   * `safari.bookmarks` resource fetcher walks the BookmarksBar
+#     tree (folder-aware) and returns rows with id/title/url/
+#     parent_id/parent_title/folder_path/kind. Supports
+#     `folder=`, `include_subfolders`, `include_reading_list`,
+#     `url_canonicalize=True` selectors.
+#   * `Bookmark` spec dataclass has an optional `folder` field.
+#   * `SafariHandler.apply("bookmark", folder=…)` creates the
+#     folder on demand and inserts the leaf.
+#   * `_canonicalize_url` (sibb_verify.py) normalizes scheme/host/
+#     port/trailing-slash for verifier compare — used when the
+#     selector passes `url_canonicalize=True`.
+#
+# First generator: `gen_safari_bookmark_specific_url` — agent
+# navigates to a target URL in Safari and bookmarks it. Pre-seeded
+# distractor bookmarks live under BookmarksBar with a mix of root +
+# subfolder placement; verifier asserts the target URL appears
+# anywhere in the BookmarksBar tree (so the generator is robust to
+# whichever folder iOS' Add-Bookmark UI defaults to).
+
+
+# Pool of URLs whose pages are stable enough across iOS bumps to use
+# as bookmark targets. Each row is (url, page_title_substring). The
+# title substring is only used for the optional title-contains check
+# — the load-bearing verifier predicate is the URL match.
+_SAFARI_BOOKMARK_TARGET_URLS: List[Tuple[str, str]] = [
+    ("https://example.com",                      "Example"),
+    ("https://en.wikipedia.org/wiki/Pi",         "Pi"),
+    ("https://en.wikipedia.org/wiki/Speed_of_light", "Speed of light"),
+    ("https://en.wikipedia.org/wiki/Marie_Curie", "Marie Curie"),
+    ("https://en.wikipedia.org/wiki/IOS",        "iOS"),
+    ("https://en.wikipedia.org/wiki/Pluto",      "Pluto"),
+    ("https://news.ycombinator.com/item?id=1",   "Hacker News"),
+    ("https://www.rfc-editor.org/rfc/rfc2606",   "RFC 2606"),
+    ("https://www.iana.org/help/example-domains", "IANA"),
+    ("https://developer.mozilla.org/en-US/docs/Web/HTML/Element/form",
+     "form"),
+]
+
+
+# Distractor URLs — distinct hosts from the target pool so a
+# substring match on the host can't collide. Titles here are
+# illustrative; the runtime title is whatever Safari fetched at
+# bookmark-save time, but for SEED bookmarks we control both.
+_SAFARI_BOOKMARK_DISTRACTOR_POOL: List[Tuple[str, str]] = [
+    ("https://www.apple.com",              "Apple"),
+    ("https://www.bing.com",               "Bing"),
+    ("https://duckduckgo.com",             "DuckDuckGo"),
+    ("https://www.yahoo.com",              "Yahoo"),
+    ("https://www.google.com",             "Google"),
+    ("https://www.github.com",             "GitHub"),
+    ("https://www.stackoverflow.com",      "Stack Overflow"),
+    ("https://www.reddit.com",             "Reddit"),
+    ("https://www.amazon.com",             "Amazon"),
+    ("https://www.cnn.com",                "CNN"),
+    ("https://www.bbc.com",                "BBC"),
+    ("https://www.nytimes.com",            "NY Times"),
+]
+
+
+# Subfolders the distractor pattern may sprinkle bookmarks into so
+# the agent's saved bookmark is NOT trivially the only bookmark under
+# the BookmarksBar root. Mirrors how a real user's Favorites looks
+# (mix of root-level and a couple of organizational subfolders).
+_SAFARI_BOOKMARK_FOLDERS: List[Optional[str]] = [
+    None, None, None,           # ~50% at root (most-likely user pattern)
+    "News", "Tech", "Reference",
+]
+
+
+def _build_diverse_bookmark_seed(n: int) -> List[Dict[str, Any]]:
+    """N distractor bookmarks with diverse titles, URLs, and folder
+    placement. Returns dicts shaped for `Bookmark.from_dict`.
+
+    Mirrors `_build_diverse_contact_seed` in spirit: ~50% at root,
+    rest sprinkled across 1-3 named subfolders so the bookmark tree
+    isn't a flat list. This is what makes the folder-aware fetcher
+    matter — a verifier that only walked BookmarksBar root would miss
+    bookmarks the agent put into "News" or "Tech".
+    """
+    picks = random.sample(_SAFARI_BOOKMARK_DISTRACTOR_POOL,
+                           min(n, len(_SAFARI_BOOKMARK_DISTRACTOR_POOL)))
+    seed: List[Dict[str, Any]] = []
+    for url, title in picks:
+        entry: Dict[str, Any] = {
+            "app": "Safari", "type": "bookmark",
+            "title": title, "url": url,
+        }
+        folder = random.choice(_SAFARI_BOOKMARK_FOLDERS)
+        if folder:
+            entry["folder"] = folder
+        seed.append(entry)
+    return seed
+
+
+def _safari_bookmark_spec(
+        bookmarks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build a Safari InitialState.spec list — one entry per
+    bookmark. Mirrors `_contact_spec`."""
+    spec: List[Dict[str, Any]] = []
+    for b in bookmarks:
+        entry: Dict[str, Any] = {
+            "app": "Safari", "type": "bookmark",
+            "title": b.get("title", ""),
+            "url":   b.get("url", ""),
+        }
+        if b.get("folder"):
+            entry["folder"] = b["folder"]
+        spec.append(entry)
+    return spec
+
+
+def _baseline_from_bookmark_seed(b: Dict[str, Any]) -> Dict[str, Any]:
+    """Pre-task fields that should be byte-preserved on a distractor
+    bookmark. Same shape as `_baseline_from_contact_seed`."""
+    return {k: v for k, v in b.items()
+              if k not in ("app", "type", "identifier")}
+
+
+def _safari_bookmark_distractor_identity_check(
+        *, target_url: str,
+        label: str = ("no irrelevant edits on distractor bookmarks")
+        ) -> Dict[str, Any]:
+    """Identity check: every bookmark EXCEPT the agent's target
+    (excluded by canonical URL match) preserves its pre-task
+    title / url / folder_path. Catches cheats where the agent
+    relabels or moves a distractor instead of creating the target.
+
+    Uses `url_canonicalize=True` so the exclusion compares canonical
+    forms — Safari may have rewritten the agent's target URL on
+    save, and we can't false-fail when the agent did the right
+    thing in a slightly different form.
+    """
+    return {
+        "kind": "identity",
+        "resource": "safari.bookmarks",
+        "selector": {"url_canonicalize": True},
+        "compare_fields": ["title", "url", "folder_path"],
+        "exclude_match": {"url": target_url},
+        "severity": "blocking",
+        "label": label,
+    }
+
+
+# ── S1 — bookmark_specific_url ───────────────────────────────────────
+
+
+def gen_safari_bookmark_specific_url():
+    """T1 / Safari: agent navigates to a target URL in Safari and
+    bookmarks the page.
+
+    Distractor pattern (mirrors Contacts T1):
+      * 5-7 pre-existing bookmarks with diverse host names
+      * ~50% live directly under BookmarksBar (Favorites in UI),
+        the rest sprinkled across "News", "Tech", "Reference"
+        subfolders
+      * Verifier walks the WHOLE BookmarksBar tree (folder-aware
+        fetcher) so the agent's bookmark surfaces no matter which
+        folder iOS' Add-Bookmark UI defaults to.
+
+    Verifier:
+      * exists  : target URL is bookmarked somewhere under
+                  BookmarksBar (canonicalized URL compare)
+      * count   : n+1 total bookmarks (no duplicate creates)
+      * identity: every distractor still has its baseline
+                  title / url / folder placement
+    """
+    n_distractors = random.choice([5, 6, 7])
+    distractors = _build_diverse_bookmark_seed(n_distractors)
+
+    # Pick a target URL whose host is NOT in the distractor pool.
+    distractor_hosts = {
+        b["url"].split("/")[2].lower() for b in distractors
+        if b.get("url", "").startswith("http")
+    }
+    candidates = [
+        (u, t) for (u, t) in _SAFARI_BOOKMARK_TARGET_URLS
+        if u.split("/")[2].lower() not in distractor_hosts
+    ]
+    target_url, target_title_hint = random.choice(candidates)
+
+    spec = _safari_bookmark_spec(distractors) + _springboard_noise()
+
+    instruction = random.choice([
+        f"Open Safari, navigate to {target_url}, and bookmark the "
+        f"page.",
+        f"In Safari, go to {target_url} and add it to your "
+        f"bookmarks.",
+        f"Bookmark the page at {target_url} in Safari.",
+    ])
+
+    verify_checks: List[Dict[str, Any]] = [
+        # The bookmark surfaces somewhere in the BookmarksBar tree
+        # (Favorites root OR any subfolder). url_canonicalize=True
+        # absorbs scheme / trailing-slash drift Safari may apply.
+        {"kind": "exists",
+         "resource": "safari.bookmarks",
+         "selector": {"url_canonicalize": True,
+                       "url": target_url},
+         "severity": "blocking",
+         "label": f"bookmark for {target_url!r} exists"},
+        # Total bookmark count = distractors + 1. Guards against the
+        # agent re-bookmarking the same page (or accidentally adding
+        # the distractor URLs).
+        {"kind": "count",
+         "resource": "safari.bookmarks",
+         "selector": {},
+         "op": "eq", "n": n_distractors + 1,
+         "severity": "blocking",
+         "label": f"exactly {n_distractors + 1} bookmarks "
+                  f"(distractors + 1 new)"},
+        # Distractors preserved byte-for-byte (title + url +
+        # folder_path).
+        _safari_bookmark_distractor_identity_check(
+            target_url=target_url),
+    ]
+
+    return Task(
+        task_id="", flow="single_safari_create",
+        apps=["Safari"],
+        instruction=instruction,
+        verify=f"safari.bookmarks[url={target_url}] exists",
+        verify_mode="db_query",
+        initial_state=InitialState(
+            present=[], absent=[], noise_records=[],
+            setup_commands=[],
+            spec=spec,
+            expected_behavior="complete",
+        ),
+        steps=8,
+        complexity=complexity_score(8, noise_count=n_distractors),
+        detail_level=0.0,
+        params={"target_url": target_url,
+                 "target_title_hint": target_title_hint,
+                 "n_distractors": n_distractors,
+                 "distractor_folders": sorted(
+                     {b.get("folder") for b in distractors
+                       if b.get("folder")}),
+                 },
+        verify_checks=verify_checks,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Safari Phase 4 / Tier 1 — first harness-based generator (2026-06-05)
+# ─────────────────────────────────────────────────────────────────────
+#
+# `gen_safari_rsvp_form` is the smallest task that exercises the full
+# Phase 4 harness stack end-to-end:
+#
+#   * MockSite with `static_pages={"/event": "rsvp_event"}` + `page_seed`
+#     + `start_path="/event"` so Safari opens directly on the form.
+#   * `harness_pages.rsvp_event` template (registered via
+#     `@register_page`) composes filler paragraphs, a collapsed venue-
+#     notes section, the RSVP form with `shuffled_fields(name, email,
+#     attending)`, 2-3 distractor buttons, more filler. Layout is
+#     deterministic per (page_seed, path) for replayability.
+#   * Verifier checks: (1) count of non-decoy submissions == 1 (catches
+#     decoy-only clicks), (2) exists path=/rsvp, (3) attribute_eq on
+#     each of fields.{name,email,attending}.
+#
+# The page CONTENT (event name, date, venue) is decoration; the
+# verifier doesn't read it. What's checked is that the agent reads
+# the *instruction* values, fills the right fields, and taps the
+# right submit.
+
+_RSVP_PERSONAS = [
+    # (first, last, email, phone) — sample personas. The generator
+    # picks ONE of email/phone per episode based on contact_type
+    # (which is derived from the SAME RNG state the page template
+    # consumes, so they always agree).
+    ("Alice",   "Chen",     "alice.chen@example.com",   "415-555-0142"),
+    ("Riley",   "Brooks",   "riley.b@example.org",       "510-555-0277"),
+    ("Jordan",  "Park",     "jpark@example.net",         "650-555-0319"),
+    ("Sam",     "Rivera",   "sam.rivera@example.com",    "408-555-0488"),
+    ("Morgan",  "Kim",      "morgan.kim@example.org",    "212-555-0531"),
+    ("Casey",   "Nguyen",   "casey.n@example.com",       "718-555-0664"),
+    ("Avery",   "Patel",    "avery.patel@example.net",   "323-555-0717"),
+    ("Quinn",   "Singh",    "quinn.s@example.com",       "503-555-0825"),
+]
+
+# Prompt-side label pools. These are DIFFERENT from the form-side
+# pools in `harness_pages.rsvp_event`. The agent gets one label in
+# the instruction ("Full Name: Alice Chen") and must map it to the
+# semantically-equivalent but textually-different field label on
+# the page ("Attendee name") to fill the form correctly.
+_PROMPT_NAME_LABELS = ["Name", "Full Name", "Your name"]
+_PROMPT_EMAIL_LABELS = ["Email", "Email address", "Contact email"]
+_PROMPT_PHONE_LABELS = ["Phone", "Phone number", "Contact number"]
+_PROMPT_ATTENDING_LABELS = ["Attending", "RSVP", "Going"]
+
+# Friendly hostnames for the harness URL the agent sees. All sit
+# under the reserved `.test` TLD (RFC 6761) so:
+#   (a) they can't collide with real DNS, and
+#   (b) `/etc/resolver/test` routes ALL of them to our DNS server
+#       (a single per-suffix resolver entry covers every `*.test`
+#       name).
+# `.example` was tempting but is NOT routed by the resolver, which
+# would send Safari to a Google search instead of the MockSite.
+_RSVP_HOSTNAMES = [
+    "aurora-conference.test",
+    "helix-symposium.test",
+    "lumen-festival.test",
+    "tessera-summit.test",
+    "events.test",
+    "rsvp.test",
+]
+
+
+def gen_safari_rsvp_form():
+    """T1 / Safari (harness-based): agent fills + submits an RSVP form
+    on a harness-served event page.
+
+    iOS Safari opens directly on `/event` (the harness page). The page
+    has filler paragraphs above/below the form, a collapsed venue-
+    notes section, a 3-field form (`name`, `email`, `attending`) in
+    randomized order, and 2-3 distractor buttons ("Save Draft" /
+    "Cancel" / etc.) the agent must NOT tap.
+
+    Verifier:
+      * `count(mock_site.submissions) == 1` — exactly one non-decoy
+        submission. Decoys are filtered out by default, so a clicked
+        "Save Draft" doesn't satisfy this on its own.
+      * `exists path=/rsvp` — the submission hit the correct endpoint.
+      * `attribute_eq fields.name/email/attending` — the values
+        match what the instruction asked for.
+
+    Cheat-resistance:
+      * Form field order randomized per seed (agent matches by label).
+      * 2-3 distractor buttons with realistic labels (agent picks by
+        text, not position).
+      * `random_pad` + filler paragraphs push the submit below the
+        fold so the agent must SCROLL to find it.
+      * `attending` value randomized so the agent can't always type
+        "yes".
+    """
+    # Pick the persona first; contact_type comes from the page-side
+    # RNG to keep generator and template aligned.
+    first, last, email, phone = random.choice(_RSVP_PERSONAS)
+    name = f"{first} {last}"
+    attending = random.choice(["yes", "no"])
+
+    site_id = f"rsvp-{uuid.uuid4().hex[:8]}"
+    hostname = random.choice(_RSVP_HOSTNAMES)
+    page_seed = random.randint(1, 0xFFFFFFFE)
+
+    # Re-derive the SAME RNG sequence the `rsvp_event` template will
+    # consume. The first choices in `rsvp_event_choices` consume the
+    # page-side randomization; we read just the values we need
+    # (`contact_type`) here. As long as we use the same `Random`
+    # state, the template's downstream choices stay aligned.
+    from harness_layout import compute_path_seed
+    from harness_pages import rsvp_event_choices
+    page_rng = random.Random(compute_path_seed(page_seed, "/event"))
+    page_cfg = rsvp_event_choices(page_rng)
+    contact_type = page_cfg["contact_type"]  # "email" or "phone"
+    contact_value = email if contact_type == "email" else phone
+
+    # Randomize the prompt-side labels (independent of page labels).
+    prompt_name_label = random.choice(_PROMPT_NAME_LABELS)
+    prompt_attending_label = random.choice(_PROMPT_ATTENDING_LABELS)
+    if contact_type == "email":
+        prompt_contact_label = random.choice(_PROMPT_EMAIL_LABELS)
+    else:
+        prompt_contact_label = random.choice(_PROMPT_PHONE_LABELS)
+
+    spec = [
+        {
+            "app": "Safari",
+            "type": "mock_site",
+            "site_id": site_id,
+            "static_pages": {"/event": "rsvp_event"},
+            "page_seed": page_seed,
+            "start_path": "/event",
+            "open_at_start": False,
+            "hostname": hostname,
+            "credentials": {},
+        },
+    ] + _springboard_noise()
+
+    # Step 5i (2026-06-07) — `{port:<site_id>}` placeholder gets
+    # resolved to the live MockSite port by `apply_initial_state` after
+    # the handler spawns the HTTP server (port is OS-assigned, so the
+    # generator cannot know it upfront). With `open_at_start=False`
+    # the agent has to TYPE the URL, so the port must be present.
+    # See sibb_state.py `_resolve_port_placeholders` for the resolver.
+    #
+    # Step 5j (2026-06-07) — agent-shown URL uses 127.0.0.1 (numeric),
+    # NOT the friendly `.test` hostname. The iOS sim's Safari URL-bar
+    # typing does NOT honor /etc/resolver/test (only `simctl openurl`
+    # does — empirically verified). Typed `.test` URLs fall through to
+    # Google search. Numeric IPs avoid the DNS lookup entirely. The
+    # `hostname` field stays in spec for logging/diagnostic continuity
+    # but is decorative from the agent's perspective. See
+    # IOS_SIM_QUIRKS §22.
+    event_url = f"http://127.0.0.1:{{port:{site_id}}}/event"
+    instruction = (
+        f"Go to Safari and open the event page: {event_url}. "
+        f"RSVP with the following info:\n"
+        f"  - {prompt_name_label}: {name}\n"
+        f"  - {prompt_contact_label}: {contact_value}\n"
+        f"  - {prompt_attending_label}: {attending}\n"
+        f"Make sure to submit. The page may have multiple "
+        f"buttons — find the one that actually submits the RSVP."
+    )
+
+    verify_checks: List[Dict[str, Any]] = [
+        # Exactly one non-decoy submission. Distractor clicks land in
+        # `_submissions` as `is_decoy=True` and the default fetcher
+        # filters them, so this catches "agent clicked Cancel" or
+        # "agent never submitted at all".
+        {"kind": "count",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id},
+         "op": "eq", "n": 1,
+         "severity": "blocking",
+         "label": "exactly one non-decoy form submission"},
+        # The submission was to /rsvp (not a typo or wrong-form).
+        {"kind": "exists",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/rsvp"},
+         "severity": "blocking",
+         "label": "submission landed at /rsvp"},
+        # Each field carries the exact value the instruction asked
+        # for. `_walk_attr` handles the `fields.X` dot notation.
+        # NOTE: the form's contact field is named `contact` regardless
+        # of whether the type is email or phone, so the verifier
+        # selector is stable.
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/rsvp"},
+         "attr": "fields.name", "value": name,
+         "severity": "blocking",
+         "label": f"name field == {name!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/rsvp"},
+         "attr": "fields.contact", "value": contact_value,
+         "severity": "blocking",
+         "label": f"contact field == {contact_value!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/rsvp"},
+         "attr": "fields.attending", "value": attending,
+         "severity": "blocking",
+         "label": f"attending field == {attending!r}"},
+    ]
+
+    return Task(
+        task_id="", flow="single_safari_harness",
+        apps=["Safari"],
+        instruction=instruction,
+        verify=(
+            f"mock_site.submissions[site_id={site_id},path=/rsvp] "
+            f"name={name!r}, contact={contact_value!r}, "
+            f"attending={attending!r}"),
+        verify_mode="db_query",
+        initial_state=InitialState(
+            present=[], absent=[], noise_records=[],
+            setup_commands=[],
+            spec=spec,
+            expected_behavior="complete",
+        ),
+        steps=10,
+        complexity=complexity_score(10, noise_count=0),
+        detail_level=0.0,
+        params={"site_id": site_id,
+                 "hostname": hostname,
+                 "event_url": event_url,
+                 "target_name": name,
+                 "target_contact": contact_value,
+                 "target_contact_type": contact_type,
+                 "target_attending": attending,
+                 "page_seed": page_seed,
+                 "prompt_name_label": prompt_name_label,
+                 "prompt_contact_label": prompt_contact_label,
+                 "prompt_attending_label": prompt_attending_label,
+                 # Mirror the page-side labels too so episode logs
+                 # capture the exact label the agent saw.
+                 "form_name_label": page_cfg["name_label"],
+                 "form_contact_label": page_cfg["contact_label"],
+                 "form_attending_label": page_cfg["attending_label"],
+                 "form_submit_label": page_cfg["submit_label"],
+                 # Step 5b (2026-06-07) — input font-size randomized
+                 # per seed across iOS Safari's auto-zoom threshold
+                 # (16 px). Logged so result aggregation can split
+                 # pass-rate by zoom vs no-zoom condition.
+                 "form_font_size_px": page_cfg["font_size_px"],
+                 "form_triggers_auto_zoom":
+                     page_cfg["font_size_px"] < 16},
+        verify_checks=verify_checks,
+    )
+
+
+def gen_safari_rsvp_form_clipped():
+    """Adversarial variant of `gen_safari_rsvp_form` — uses the
+    `rsvp_event_clipped` template that positions the submit button
+    past the bottom-right of the viewport. The agent must SCROLL
+    down AND right (or use SWIPE) to bring the button into view
+    before tapping it. Tests the agent's recovery when an interactive
+    element isn't initially visible.
+
+    Verifier and instruction format mirror `gen_safari_rsvp_form`
+    so the same task spec works — only the page rendering differs.
+    """
+    first, last, email, phone = random.choice(_RSVP_PERSONAS)
+    name = f"{first} {last}"
+    attending = random.choice(["yes", "no"])
+
+    site_id = f"rsvp-clipped-{uuid.uuid4().hex[:8]}"
+    hostname = random.choice(_RSVP_HOSTNAMES)
+    page_seed = random.randint(1, 0xFFFFFFFE)
+    from harness_layout import compute_path_seed
+    from harness_pages import rsvp_event_choices
+    page_rng = random.Random(compute_path_seed(page_seed, "/event"))
+    page_cfg = rsvp_event_choices(page_rng)
+    contact_type = page_cfg["contact_type"]
+    contact_value = email if contact_type == "email" else phone
+
+    prompt_name_label = random.choice(_PROMPT_NAME_LABELS)
+    prompt_attending_label = random.choice(_PROMPT_ATTENDING_LABELS)
+    if contact_type == "email":
+        prompt_contact_label = random.choice(_PROMPT_EMAIL_LABELS)
+    else:
+        prompt_contact_label = random.choice(_PROMPT_PHONE_LABELS)
+
+    spec = [
+        {
+            "app": "Safari",
+            "type": "mock_site",
+            "site_id": site_id,
+            "static_pages": {"/event": "rsvp_event_clipped"},
+            "page_seed": page_seed,
+            "start_path": "/event",
+            "open_at_start": False,
+            "hostname": hostname,
+            "credentials": {},
+        },
+    ] + _springboard_noise()
+
+    # Step 5i (2026-06-07) — see gen_safari_rsvp_form for the
+    # `{port:<site_id>}` placeholder contract.
+    # Step 5j — see gen_safari_rsvp_form: sim Safari URL-bar typing
+    # cannot resolve .test hostnames, so use numeric IP.
+    event_url = f"http://127.0.0.1:{{port:{site_id}}}/event"
+    instruction = (
+        f"Go to Safari and open the event page: {event_url}. "
+        f"RSVP with the following info:\n"
+        f"  - {prompt_name_label}: {name}\n"
+        f"  - {prompt_contact_label}: {contact_value}\n"
+        f"  - {prompt_attending_label}: {attending}\n"
+        f"Make sure to submit. The submit button may not be "
+        f"initially visible — scroll/swipe within the page to "
+        f"bring it into view before tapping it."
+    )
+
+    verify_checks: List[Dict[str, Any]] = [
+        {"kind": "count", "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id},
+         "op": "eq", "n": 1, "severity": "blocking",
+         "label": "exactly one non-decoy form submission"},
+        {"kind": "exists", "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/rsvp"},
+         "severity": "blocking",
+         "label": "submission landed at /rsvp"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/rsvp"},
+         "attr": "fields.name", "value": name, "severity": "blocking",
+         "label": f"name field == {name!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/rsvp"},
+         "attr": "fields.contact", "value": contact_value,
+         "severity": "blocking",
+         "label": f"contact field == {contact_value!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/rsvp"},
+         "attr": "fields.attending", "value": attending,
+         "severity": "blocking",
+         "label": f"attending field == {attending!r}"},
+    ]
+
+    return Task(
+        task_id="", flow="single_safari_harness_clipped",
+        apps=["Safari"],
+        instruction=instruction,
+        verify=(
+            f"mock_site.submissions[site_id={site_id},path=/rsvp] "
+            f"name={name!r}, contact={contact_value!r}, "
+            f"attending={attending!r}"),
+        verify_mode="db_query",
+        initial_state=InitialState(
+            present=[], absent=[], noise_records=[],
+            setup_commands=[], spec=spec,
+            expected_behavior="complete"),
+        steps=15,
+        complexity=complexity_score(15, noise_count=0),
+        detail_level=0.0,
+        params={"site_id": site_id, "hostname": hostname,
+                 "event_url": event_url, "target_name": name,
+                 "target_contact": contact_value,
+                 "target_contact_type": contact_type,
+                 "target_attending": attending,
+                 "page_seed": page_seed,
+                 "variant": "clipped",
+                 "prompt_name_label": prompt_name_label,
+                 "prompt_contact_label": prompt_contact_label,
+                 "prompt_attending_label": prompt_attending_label,
+                 "form_submit_label": page_cfg["submit_label"],
+                 # Step 5b (2026-06-07) — see gen_safari_rsvp_form.
+                 "form_font_size_px": page_cfg["font_size_px"],
+                 "form_triggers_auto_zoom":
+                     page_cfg["font_size_px"] < 16},
+        verify_checks=verify_checks,
+    )
+
+
+# ── Safari shop V0 (Step 5M, 2026-06-08) ──────────────────────────────────
+#
+# `gen_safari_shop_pick_by_attrs` — agent searches for products in a
+# mock shop, picks the one matching the instruction's attributes
+# (category × brand × max-price), buys it via the checkout form.
+#
+# Catalog: WebMall (research-permissive; see sibb/benchmark/data/NOTICE).
+# Page templates: shop_search_results / shop_pdp / shop_checkout in
+# `harness_pages.py`. Generator + template agree on the same winner +
+# distractors via the shared `shop_pick_by_attrs_choices(rng)` helper
+# called over identical page-seed-derived rngs.
+#
+# V0 scope (Y/N):
+#   * Search → pick → checkout flow      Y
+#   * Persona shipping fields            Y (name + street + city + state + zip)
+#   * Variant pickers (size/color)       N — WebMall has none; V0+ synthesizes
+#   * Cart page                          N — PDP "Buy Now" goes direct to checkout
+#   * Address from Contact (V1)          N — flat persona inline in instruction
+#   * Card from Contact notes / Files (V2/V3) N — payment is inline form fields
+#   * In-site `/account/cards` (V4)      N
+#   * Dark patterns                      N — covered by gen_safari_shop_avoid_dark_pattern
+
+def gen_safari_shop_pick_by_attrs():
+    """Safari shop task — agent lands on a minimal storefront, types a
+    search query into the search bar, picks the unique SKU matching
+    the instruction's constraints from the BM25 search results, and
+    completes checkout.
+
+    Step 5N (2026-06-08) — V0.5 rewrite:
+      * Drops the sponsored-decoy badge (was unprecedented in the
+        literature per `sibb_runs/shopping_landing_and_search.md`).
+      * Uses a minimal WebShop-style `/` landing page with a real
+        search bar (not direct URL navigation to `/search`).
+      * Search is BM25-backed against the catalog corpus
+        (`title + brand + description`); top 8 results render as
+        product cards. The agent's query DECIDES which 8.
+      * Picks a winner that's UNIQUELY identified by (brand,
+        category, max_price) in the catalog — closes the
+        multi-match cheat earlier reviewers flagged.
+      * Randomizes instruction archetype 50/50:
+          Q1 (attribute-prose): agent must invent the query from
+              brand + category + price cap.
+          Q2 (named-product): instruction names a short search hint
+              the agent types verbatim.
+      * Q3 (URL-anchored) and Q4 (filter+sort cascade) deferred —
+        see `TODO_DEFERRED.md` §H7-shop and the dedicated
+        `gen_safari_shop_filter_and_sort` generator.
+    """
+    site_id = f"shop-{uuid.uuid4().hex[:8]}"
+    hostname = random.choice(_RSVP_HOSTNAMES)
+    page_seed = random.randint(1, 0xFFFFFFFE)
+
+    # Re-derive the SAME rng the templates will use so generator +
+    # templates agree on the same winner + archetype + persona.
+    # `/` (landing) is the entry point so we seed on that path.
+    from harness_layout import compute_path_seed
+    from harness_pages import shop_pick_by_attrs_choices
+    landing_rng = random.Random(compute_path_seed(page_seed, "/"))
+    cfg = shop_pick_by_attrs_choices(landing_rng, page_seed=page_seed)
+    winner = cfg["winner"]
+    persona = cfg["persona"]  # (first, last, street, city, state, zip)
+    persona_name = f"{persona[0]} {persona[1]}"
+
+    spec = [
+        {
+            "app": "Safari",
+            "type": "mock_site",
+            "site_id": site_id,
+            "static_pages": {
+                "/":              "shop_landing",
+                "/search":        "shop_search_results",
+                "/product/":      "shop_pdp",
+                "/checkout":      "shop_checkout",
+                "/account/cards": "shop_account_cards",
+            },
+            "page_seed": page_seed,
+            "start_path": "/",
+            "open_at_start": False,
+            "hostname": hostname,
+            "credentials": {},
+        },
+    ] + _springboard_noise()
+
+    # Numeric IP per 5j — sim Safari URL-bar can't resolve `.test`.
+    landing_url = f"http://127.0.0.1:{{port:{site_id}}}/"
+
+    # Build the instruction. Two archetypes — see helper docstring.
+    if cfg["archetype"] == "Q1":
+        # Attribute-prose: agent infers query from brand + category.
+        task_lines = (
+            f"You're shopping for a {winner.brand} product in the "
+            f"{cfg['category']} section. Buy the CHEAPEST one priced "
+            f"under ${cfg['max_price_cents'] / 100:.2f}.\n"
+            f"\n"
+            f"Use the search bar on the landing page to find "
+            f"candidates — pick a search term that will surface "
+            f"the right category of product. Compare the prices on "
+            f"the results page before picking.\n"
+        )
+    else:  # Q2
+        task_lines = (
+            f"Search the shop for products matching this query: "
+            f'"{cfg["search_hint"]}". Buy the CHEAPEST one priced '
+            f"under ${cfg['max_price_cents'] / 100:.2f}.\n"
+            f"\n"
+            f"Use the search bar on the landing page. Type the "
+            f"query above into it, then compare the prices on the "
+            f"results before picking.\n"
+        )
+    # V4 (Step 5O, 2026-06-09): when use_saved_cards, instruct the
+    # agent to fetch payment details from /account/cards first and
+    # use the PERSONAL card on checkout. Renders 3 extra payment
+    # fields under "Shipping & payment" on the checkout page.
+    if cfg["use_saved_cards"]:
+        personal = cfg["personal_card"]
+        payment_block = (
+            f"\n"
+            f"Your saved payment methods live at /account/cards on "
+            f"this shop. Before checking out, visit that page, find "
+            f"your PERSONAL card, and read its last 4 digits and "
+            f"expiration date. On checkout, fill the payment fields "
+            f"with the PERSONAL card's details — NOT the Work card.\n"
+        )
+    else:
+        payment_block = ""
+    instruction = (
+        f"Go to Safari and open the shop: {landing_url}.\n"
+        f"\n"
+        f"{task_lines}"
+        f"\n"
+        f"After picking a product, use its Buy Now link to proceed "
+        f"to checkout. On the checkout page, fill in the shipping "
+        f"address and place the order. Use this persona:\n"
+        f"  - Full name: {persona_name}\n"
+        f"  - Street address: {persona[2]}\n"
+        f"  - City: {persona[3]}\n"
+        f"  - State: {persona[4]}\n"
+        f"  - ZIP code: {persona[5]}\n"
+        f"{payment_block}"
+    )
+
+    verify_checks: List[Dict[str, Any]] = [
+        # Exactly one non-decoy checkout submission.
+        {"kind": "count",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "op": "eq", "n": 1, "severity": "blocking",
+         "label": "exactly one /checkout submission"},
+        # The submitted SKU is the winner. The shop_checkout template
+        # ships a hidden `sku` field bound to the path's `?sku=` query
+        # so picking the wrong PDP carries through to a wrong sku.
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.sku", "value": winner.sku_id,
+         "severity": "blocking",
+         "label": f"sku == {winner.sku_id}"},
+        # Shipping fields match the persona.
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_name", "value": persona_name,
+         "severity": "blocking",
+         "label": f"ship_name == {persona_name!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_street", "value": persona[2],
+         "severity": "blocking",
+         "label": f"ship_street == {persona[2]!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_city", "value": persona[3],
+         "severity": "blocking",
+         "label": f"ship_city == {persona[3]!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_state", "value": persona[4],
+         "severity": "blocking",
+         "label": f"ship_state == {persona[4]!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_zip", "value": persona[5],
+         "severity": "blocking",
+         "label": f"ship_zip == {persona[5]!r}"},
+    ]
+
+    # V4 (Step 5O, 2026-06-09): when use_saved_cards, require the
+    # 3 PERSONAL-card payment fields. Picking the Work card or
+    # fabricating numbers both fail the verifier.
+    if cfg["use_saved_cards"]:
+        personal = cfg["personal_card"]
+        verify_checks += [
+            {"kind": "attribute_eq",
+             "resource": "mock_site.submissions",
+             "selector": {"site_id": site_id, "path": "/checkout"},
+             "attr": "fields.pay_card_last4",
+             "value": personal["last4"],
+             "severity": "blocking",
+             "label":
+                 f"pay_card_last4 == {personal['last4']!r}"},
+            {"kind": "attribute_eq",
+             "resource": "mock_site.submissions",
+             "selector": {"site_id": site_id, "path": "/checkout"},
+             "attr": "fields.pay_exp_mm",
+             "value": personal["exp_mm"],
+             "severity": "blocking",
+             "label":
+                 f"pay_exp_mm == {personal['exp_mm']!r}"},
+            {"kind": "attribute_eq",
+             "resource": "mock_site.submissions",
+             "selector": {"site_id": site_id, "path": "/checkout"},
+             "attr": "fields.pay_exp_yy",
+             "value": personal["exp_yy"],
+             "severity": "blocking",
+             "label":
+                 f"pay_exp_yy == {personal['exp_yy']!r}"},
+        ]
+
+    return Task(
+        task_id="", flow="single_safari_shop",
+        apps=["Safari"],
+        instruction=instruction,
+        verify=(
+            f"mock_site.submissions[site_id={site_id},path=/checkout] "
+            f"sku={winner.sku_id!r}, ship_name={persona_name!r}, "
+            f"ship_zip={persona[5]!r}"),
+        verify_mode="db_query",
+        initial_state=InitialState(
+            present=[], absent=[], noise_records=[],
+            setup_commands=[],
+            spec=spec,
+            expected_behavior="complete",
+        ),
+        steps=20,  # search-pick-buy is ~12-18 turns for a competent LLM
+        complexity=complexity_score(20, noise_count=0),
+        detail_level=0.0,
+        params={
+            "site_id": site_id,
+            "hostname": hostname,
+            "landing_url": landing_url,
+            "page_seed": page_seed,
+            "target_sku":     winner.sku_id,
+            "target_name":    winner.name,
+            "target_brand":   winner.brand,
+            "target_price_cents": winner.price_cents,
+            "target_category":     cfg["category"],
+            "target_max_price_cents": cfg["max_price_cents"],
+            "persona_name":   persona_name,
+            "persona_street": persona[2],
+            "persona_city":   persona[3],
+            "persona_state":  persona[4],
+            "persona_zip":    persona[5],
+            "archetype":      cfg["archetype"],
+            "search_hint":    cfg["search_hint"],
+            "use_saved_cards": cfg["use_saved_cards"],
+            "personal_card":   cfg["personal_card"],
+            "work_card":       cfg["work_card"],
+        },
+        verify_checks=verify_checks,
+    )
+
+
+def gen_safari_shop_filter_and_sort():
+    """Safari shop Q4 — filter + sort cascade. Distinct from
+    `gen_safari_shop_pick_by_attrs` (Q1/Q2): NO typed search, NO
+    BM25. The agent reaches the winner by applying category +
+    brand filters AND selecting a sort order on a faceted /browse
+    page.
+
+    Same catalog, persona, V4 saved-cards axis, and verifier shape
+    as the V0.5 generator. Reuses the V0.5 cheapest-winner
+    eligibility list (`Catalog.eligible_cheapest_winners`) so the
+    winner is the UNIQUE cheapest in its (brand, category) family
+    under the chosen cap — applying (cat=X, brand=Y,
+    sort=price_asc) ALWAYS makes the winner the first result.
+
+    V4 (`use_saved_cards`) axis applies orthogonally — same
+    probability, same page_seed-only derivation as Q1/Q2 — and
+    reuses shop_pdp + shop_checkout + shop_account_cards templates
+    without modification.
+    """
+    site_id = f"shop-{uuid.uuid4().hex[:8]}"
+    hostname = random.choice(_RSVP_HOSTNAMES)
+    page_seed = random.randint(1, 0xFFFFFFFE)
+
+    from harness_layout import compute_path_seed
+    from harness_pages import shop_filter_sort_choices
+    landing_rng = random.Random(compute_path_seed(page_seed, "/"))
+    cfg = shop_filter_sort_choices(landing_rng, page_seed=page_seed)
+    winner = cfg["winner"]
+    persona = cfg["persona"]
+    persona_name = f"{persona[0]} {persona[1]}"
+
+    spec = [
+        {
+            "app": "Safari",
+            "type": "mock_site",
+            "site_id": site_id,
+            # Q4 reuses shop_pdp + shop_checkout + shop_account_cards
+            # because the V4 axis is page_seed-only — the templates
+            # only need page_seed to derive cards, never archetype.
+            "static_pages": {
+                "/":              "shop_q4_landing",
+                "/browse":        "shop_q4_browse",
+                "/product/":      "shop_pdp",
+                "/checkout":      "shop_checkout",
+                "/account/cards": "shop_account_cards",
+            },
+            "page_seed": page_seed,
+            "start_path": "/",
+            "open_at_start": False,
+            "hostname": hostname,
+            "credentials": {},
+        },
+    ] + _springboard_noise()
+
+    landing_url = f"http://127.0.0.1:{{port:{site_id}}}/"
+
+    task_lines = (
+        f"You're shopping for a product from this catalog. Browse "
+        f"the store at /browse and apply these filters and sort:\n"
+        f"  - Category: {cfg['category']}\n"
+        f"  - Brand: {winner.brand}\n"
+        f"  - Sort by: Price (low to high)\n"
+        f"\n"
+        f"After applying all three, the FIRST product in the "
+        f"results is the cheapest match — pick that one. "
+        f"Maximum price: ${cfg['max_price_cents'] / 100:.2f}.\n"
+    )
+
+    if cfg["use_saved_cards"]:
+        payment_block = (
+            f"\n"
+            f"Your saved payment methods live at /account/cards on "
+            f"this shop. Before checking out, visit that page, find "
+            f"your PERSONAL card, and read its last 4 digits and "
+            f"expiration date. On checkout, fill the payment fields "
+            f"with the PERSONAL card's details — NOT the Work card.\n"
+        )
+    else:
+        payment_block = ""
+
+    instruction = (
+        f"Go to Safari and open the shop: {landing_url}.\n"
+        f"\n"
+        f"{task_lines}"
+        f"\n"
+        f"After picking a product, use its Buy Now link to proceed "
+        f"to checkout. On the checkout page, fill in the shipping "
+        f"address and place the order. Use this persona:\n"
+        f"  - Full name: {persona_name}\n"
+        f"  - Street address: {persona[2]}\n"
+        f"  - City: {persona[3]}\n"
+        f"  - State: {persona[4]}\n"
+        f"  - ZIP code: {persona[5]}\n"
+        f"{payment_block}"
+    )
+
+    verify_checks: List[Dict[str, Any]] = [
+        {"kind": "count",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "op": "eq", "n": 1, "severity": "blocking",
+         "label": "exactly one /checkout submission"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.sku", "value": winner.sku_id,
+         "severity": "blocking",
+         "label": f"sku == {winner.sku_id}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_name", "value": persona_name,
+         "severity": "blocking",
+         "label": f"ship_name == {persona_name!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_street", "value": persona[2],
+         "severity": "blocking",
+         "label": f"ship_street == {persona[2]!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_city", "value": persona[3],
+         "severity": "blocking",
+         "label": f"ship_city == {persona[3]!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_state", "value": persona[4],
+         "severity": "blocking",
+         "label": f"ship_state == {persona[4]!r}"},
+        {"kind": "attribute_eq",
+         "resource": "mock_site.submissions",
+         "selector": {"site_id": site_id, "path": "/checkout"},
+         "attr": "fields.ship_zip", "value": persona[5],
+         "severity": "blocking",
+         "label": f"ship_zip == {persona[5]!r}"},
+    ]
+
+    if cfg["use_saved_cards"]:
+        personal = cfg["personal_card"]
+        verify_checks += [
+            {"kind": "attribute_eq",
+             "resource": "mock_site.submissions",
+             "selector": {"site_id": site_id, "path": "/checkout"},
+             "attr": "fields.pay_card_last4",
+             "value": personal["last4"],
+             "severity": "blocking",
+             "label":
+                 f"pay_card_last4 == {personal['last4']!r}"},
+            {"kind": "attribute_eq",
+             "resource": "mock_site.submissions",
+             "selector": {"site_id": site_id, "path": "/checkout"},
+             "attr": "fields.pay_exp_mm",
+             "value": personal["exp_mm"],
+             "severity": "blocking",
+             "label":
+                 f"pay_exp_mm == {personal['exp_mm']!r}"},
+            {"kind": "attribute_eq",
+             "resource": "mock_site.submissions",
+             "selector": {"site_id": site_id, "path": "/checkout"},
+             "attr": "fields.pay_exp_yy",
+             "value": personal["exp_yy"],
+             "severity": "blocking",
+             "label":
+                 f"pay_exp_yy == {personal['exp_yy']!r}"},
+        ]
+
+    return Task(
+        task_id="", flow="single_safari_shop_filter",
+        apps=["Safari"],
+        instruction=instruction,
+        verify=(
+            f"mock_site.submissions[site_id={site_id},path=/checkout] "
+            f"sku={winner.sku_id!r}, ship_name={persona_name!r}, "
+            f"ship_zip={persona[5]!r}"),
+        verify_mode="db_query",
+        initial_state=InitialState(
+            present=[], absent=[], noise_records=[],
+            setup_commands=[],
+            spec=spec,
+            expected_behavior="complete",
+        ),
+        steps=22,
+        complexity=complexity_score(22, noise_count=0),
+        detail_level=0.0,
+        params={
+            "site_id": site_id,
+            "hostname": hostname,
+            "landing_url": landing_url,
+            "page_seed": page_seed,
+            "target_sku":     winner.sku_id,
+            "target_name":    winner.name,
+            "target_brand":   winner.brand,
+            "target_price_cents": winner.price_cents,
+            "target_category":     cfg["category"],
+            "target_max_price_cents": cfg["max_price_cents"],
+            "persona_name":   persona_name,
+            "persona_street": persona[2],
+            "persona_city":   persona[3],
+            "persona_state":  persona[4],
+            "persona_zip":    persona[5],
+            "canonical_sort":  cfg["canonical_sort"],
+            "use_saved_cards": cfg["use_saved_cards"],
+            "personal_card":   cfg["personal_card"],
+            "work_card":       cfg["work_card"],
+        },
+        verify_checks=verify_checks,
+    )
+
+
 # ── Generator registry ────────────────────────────────────────────────────────
 # Generators are gated on APP_REGISTRY["available"].
 # When an app becomes available, move its generators from
@@ -9522,6 +10648,16 @@ ALL_GENERATORS = {
     ],
     "tier5_contacts": [
         gen_lookup_phone_by_name,
+    ],
+    # Safari Phase 4 / Tier 1 (2026-06-05). Single-app Safari
+    # generators — bookmark mutation via the folder-aware fetcher,
+    # plus harness-served form fill (Phase 4 first harness gen).
+    "tier1_safari": [
+        gen_safari_bookmark_specific_url,
+        gen_safari_rsvp_form,
+        gen_safari_rsvp_form_clipped,
+        gen_safari_shop_pick_by_attrs,
+        gen_safari_shop_filter_and_sort,
     ],
     # Phase 3 cross-app showcase (2026-05-26+).
     "cross_app": [

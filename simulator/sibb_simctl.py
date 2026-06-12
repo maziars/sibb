@@ -86,8 +86,17 @@ async def simctl_create(name: str, device_type: str,
     return udid
 
 
-async def simctl_boot(udid: str, timeout: float = 60.0) -> None:
-    """Boot a simulator. Idempotent — no-op if already booted."""
+async def simctl_boot(udid: str, timeout: float = 120.0) -> None:
+    """Boot a simulator. Idempotent — no-op if already booted.
+
+    Timeout raised from 60 → 120s on 2026-06-11 after the hybrid v3b
+    run hit a `simctl boot timed out after 60.0s` on the third recycle
+    of the slate. Cold boots take 20-30s on a warm Mac but the time
+    grows after several shutdown/boot cycles because CoreSimulatorService
+    accumulates state. 120s gives one degraded boot enough headroom
+    before we declare the sim un-recoverable; further failures will
+    bubble up as `RuntimeError` for the runner's recycle-failed path.
+    """
     rc, _, err = await _run_simctl("boot", udid, timeout=timeout)
     if rc == 0:
         return
@@ -95,6 +104,27 @@ async def simctl_boot(udid: str, timeout: float = 60.0) -> None:
     if "already booted" in lower or "current state: booted" in lower:
         return
     raise RuntimeError(f"simctl boot {udid} failed: {err}")
+
+
+async def simctl_quit_simulator_app(timeout: float = 5.0) -> None:
+    """Kill the Simulator.app process tree. Use between recycles to
+    drop UI-side state CoreSimulatorService accumulates and to let
+    the next `simctl boot` start from a clean place.
+
+    Documented in Apple Developer Forum #713921 + Maestro #3318 as a
+    workaround for CoreSimulator state-leak across long batches. Best-
+    effort — pkill returns non-zero when nothing matched.
+    """
+    import asyncio as _asyncio
+    proc = await _asyncio.create_subprocess_exec(
+        "pkill", "-x", "Simulator",
+        stdout=_asyncio.subprocess.DEVNULL,
+        stderr=_asyncio.subprocess.DEVNULL,
+    )
+    try:
+        await _asyncio.wait_for(proc.wait(), timeout=timeout)
+    except _asyncio.TimeoutError:
+        proc.kill()
 
 
 async def simctl_clone(src_udid: str, name: str, *,

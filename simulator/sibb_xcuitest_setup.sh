@@ -442,6 +442,127 @@ func dumpTree(_ app: XCUIApplication) -> [String: Any] {
         ]
     }
 
+    // ─── accessory bar (predictive text + inputAccessoryView) ────────
+    // The predictive-text strip and any inputAccessoryView (Safari's
+    // "Previous / Next / Done" toolbar above the keyboard) sit ABOVE
+    // the .keyboard frame and are NOT part of keyFrames either. The
+    // pre-tap occlusion guard and the AX viewport filter need to know
+    // about them; otherwise taps route into the prediction strip.
+    //
+    // We identify them by label-match against stable iOS strings.
+    // Union their frames into `accessoryBarFrameDict`. As of Step 3
+    // (2026-06-06) this is DIAGNOSTIC-ONLY on the Python side —
+    // `keyboard_y_min` is just `kb_frame.y`, so the bar's elements
+    // (Done/Next/Previous/predictions) survive the visibility filter
+    // and become agent-tappable. Empirical probe showed these are
+    // useful UI surfaces, not occlusion. Kept emitting because the
+    // diagnostics dict still surfaces the frame for post-hoc JSONL
+    // analysis (e.g. "did this episode see a bar?").
+    var accessoryRects: [CGRect] = []
+    // Gates (task #213 — robustness, task #216 dropped the bottom-
+    // half guard for landscape support): only treat label matches as
+    // genuine keyboard accessory when ALL of these hold:
+    //   1. keyboardVisible == true  (no kb ⇒ no accessory)
+    //   2. frame.origin.y < keyboardTop  (accessory sits ABOVE kb)
+    //   3. role + height match per label class:
+    //      * Buttons (Done/Next/Previous): elementType == .button AND
+    //        frame.height < 50. Excludes sheet "Done" / nav-bar buttons
+    //        elsewhere in the app that just share the label.
+    //      * "Typing Predictions" container: elementType is typically
+    //        .other (the predictive bar wrapper), accept up to 60 px.
+    // The English literals remain a documented localization fragility —
+    // see _SAFARI_BOTTOM_CHROME_LABELS comment in sibb_scaffold.py.
+    func gatherAccessory(_ snap: XCUIElementSnapshot) {
+        guard keyboardVisible else { return }
+        let label = snap.label
+        let lower = label.lowercased()
+        let isButtonLabel = (lower == "previous" || lower == "next" || lower == "done")
+        let isPredictiveContainer = (lower == "typing predictions")
+        if isButtonLabel || isPredictiveContainer {
+            let f = snap.frame
+            // Position guard: must sit ABOVE the keyboard top. The
+            // earlier `> screen_h * 0.5` clause broke landscape (kb
+            // top ~y=170 on iPhone 16; predictive bar at ~y=130 fell
+            // below the half-screen line). `< keyboardTop` is the
+            // orientation-independent test.
+            let topOk = (f.origin.y < keyboardTop)
+            let heightOk: Bool
+            let roleOk: Bool
+            if isButtonLabel {
+                heightOk = (f.height > 0 && f.height < 50)
+                roleOk = (snap.elementType == .button)
+            } else {
+                heightOk = (f.height > 0 && f.height < 60)
+                roleOk = true  // predictive bar wrapper role is unstable
+            }
+            if topOk && heightOk && roleOk {
+                accessoryRects.append(f)
+            }
+        }
+        for child in snap.children { gatherAccessory(child) }
+    }
+    gatherAccessory(topSnap)
+    var accessoryBarFrameDict: [String: Double]? = nil
+    if !accessoryRects.isEmpty {
+        let minX = accessoryRects.map { $0.minX }.min()!
+        let minY = accessoryRects.map { $0.minY }.min()!
+        let maxX = accessoryRects.map { $0.maxX }.max()!
+        let maxY = accessoryRects.map { $0.maxY }.max()!
+        accessoryBarFrameDict = [
+            "x":      Double(minX),
+            "y":      Double(minY),
+            "width":  Double(maxX - minX),
+            "height": Double(maxY - minY),
+        ]
+    }
+
+    // ─── WKWebView zoom scale ────────────────────────────────────────
+    // When iOS Safari auto-zooms on input focus, WKWebView reports its
+    // web-content AX frames in zoomed-doc coordinates. The PYTHON side
+    // tries to infer this via overflow / kb-above-screen heuristics
+    // (see sibb_scaffold.py — those run as fallback). Authoritative:
+    // probe the WebView's underlying scrollView via KVC. Same pattern
+    // as `snapshotAdjustable()` (KVC against `UIAccessibilityTraits`).
+    //
+    // Best-effort. Returns nil if there's no WebView (non-Safari app),
+    // or if the KVC probe is gated. The Python detection cascade then
+    // falls back to its heuristics.
+    var zoomScale: Double? = nil
+    // Live-element zoom-scale probe (Step 5, 2026-06-07).
+    //
+    // Walk a query (not a snapshot) to find Safari's WKWebView, drill
+    // into its enclosed scrollView, and call `value(forKey:"zoomScale")`.
+    // XCUITest proxies KVC through to the underlying UIKit object on
+    // iOS 17+; UIScrollView exposes `zoomScale` as a public Double
+    // property. Empirical probe required to confirm the proxy works on
+    // iOS 26.3 — see `sibb_probe_zoom_scale_kvc.py`.
+    //
+    // We use a fresh query (not the cached `findFirst(topSnap, ...)`)
+    // because snapshots strip the underlying-object KVC pathway.
+    // Wrap in SIBBSafeRun to catch Objective-C exceptions from any
+    // proxy-not-implemented case (returns silently with zoomScale=nil).
+    SIBBSafeRun(nil) {
+        let webViewQuery = app.descendants(matching: .webView)
+        let webView = webViewQuery.element(boundBy: 0)
+        if webView.exists {
+            let scrollViewQuery = webView.descendants(matching: .scrollView)
+            let scroll = scrollViewQuery.element(boundBy: 0)
+            if scroll.exists {
+                // value(forKey:) returns an Any? — coerce defensively.
+                // UIScrollView.zoomScale is CGFloat (float on 32-bit
+                // sims, Double on 64-bit). We accept both.
+                let raw = scroll.value(forKey: "zoomScale")
+                if let d = raw as? Double {
+                    zoomScale = d
+                } else if let f = raw as? Float {
+                    zoomScale = Double(f)
+                } else if let n = raw as? NSNumber {
+                    zoomScale = n.doubleValue
+                }
+            }
+        }
+    }
+
     // Include EVERY substantial top-level window (>= 20% of screen
     // area) — not just the largest. In-app alerts, action sheets,
     // share sheets, modals, and date pickers are presented as
@@ -487,6 +608,12 @@ func dumpTree(_ app: XCUIApplication) -> [String: Any] {
     ]
     if let kf = keyboardFrameDict {
         responseDict["keyboard_frame"] = kf
+    }
+    if let af = accessoryBarFrameDict {
+        responseDict["accessory_bar_frame"] = af
+    }
+    if let zs = zoomScale {
+        responseDict["zoom_scale"] = zs
     }
     return responseDict
 }
@@ -3179,6 +3306,12 @@ class SIBBServer: XCTestCase {
                 if let kf = treeData["keyboard_frame"] {
                     resp["keyboard_frame"] = kf
                 }
+                if let af = treeData["accessory_bar_frame"] {
+                    resp["accessory_bar_frame"] = af
+                }
+                if let zs = treeData["zoom_scale"] {
+                    resp["zoom_scale"] = zs
+                }
                 sendResponse(connection, resp)
 
             case "tap":
@@ -3197,12 +3330,91 @@ class SIBBServer: XCTestCase {
                 waitForSettle(app)
                 sendResponse(connection, ["ok": true])
 
+            case "double_tap":
+                // Coordinate-based double-tap. Dispatches via
+                // `XCUICoordinate.doubleTap()` — Apple's native gesture
+                // API that fires through the same touch-injection
+                // pipeline real input devices use.
+                //
+                // PRIMARY USE: reset Safari's WKWebView auto-zoom. After
+                // auto-zoom on input focus, the page stays zoomed even
+                // when the kb is dismissed; double-tap on a non-input
+                // page region invokes WebKit's "zoom to fit" recognizer
+                // (verified empirically — see IOS_SIM_QUIRKS §21). Two
+                // rapid single `tap()` calls do NOT fire this recognizer
+                // (synthetic event timing/path differs).
+                //
+                // For non-Safari uses (Maps zoom-in, Photos fit-toggle),
+                // this is also the right API.
+                guard let app = currentApp else {
+                    sendResponse(connection,
+                        ["ok": false, "error": "no_app"]); break
+                }
+                if let x = cmdDict["x"] as? Double,
+                   let y = cmdDict["y"] as? Double {
+                    let coord = app.coordinate(withNormalizedOffset: .zero)
+                        .withOffset(CGVector(dx: x, dy: y))
+                    coord.doubleTap()
+                } else if let ref = cmdDict["ref"] as? String, !ref.isEmpty {
+                    let el = app.descendants(matching: .any)[ref]
+                    if el.exists { el.doubleTap() }
+                    else {
+                        sendResponse(connection,
+                            ["ok": false, "error": "not_found"]); break
+                    }
+                } else {
+                    sendResponse(connection,
+                        ["ok": false,
+                         "error": "double_tap requires (x,y) or ref"]); break
+                }
+                waitForSettle(app)
+                sendResponse(connection, ["ok": true])
+
             case "type":
                 guard let app = currentApp,
                       let text = cmdDict["text"] as? String else {
                     sendResponse(connection, ["ok": false, "error": "bad_args"]); break
                 }
                 app.typeText(text)
+                waitForSettle(app, timeout: 0.5)
+                sendResponse(connection, ["ok": true])
+
+            case "return":
+                // Fire a Return key event into the currently keyboard-
+                // focused element via `app.typeText("\n")`. iOS interprets
+                // "\n" against the focused field's keyboard configuration
+                // and dispatches whatever the Return key is contextually
+                // labeled — `Go` / `Search` / `Done` / `Next` / `Return`
+                // — without us needing to know the label.
+                //
+                // PRIMARY USE: commit a typed URL in Safari's URL bar.
+                // The keyboard's Return key isn't surfaced in AX, so the
+                // agent has no other way to commit (tapping a suggestion
+                // submits as a search instead).
+                //
+                // ALSO USEFUL FOR: in-app search bars, "name this thing"
+                // dialogs, login forms (Return on last field submits),
+                // web forms (Return submits the default form action).
+                //
+                // Step 5L-C (2026-06-08) — gate on keyboard visibility.
+                // Calling `typeText("\n")` with no keyboard up crashed
+                // the XCUITest socket on iOS 26.3 (verified seed=1 of
+                // the 5g-5k baseline run). The cleaner contract: if no
+                // keyboard is visible, return a structured error so the
+                // agent can recover (TAP-to-focus first, then RETURN).
+                guard let app = currentApp else {
+                    sendResponse(connection,
+                        ["ok": false, "error": "no_app"]); break
+                }
+                if !app.keyboards.element.exists {
+                    sendResponse(connection,
+                        ["ok": false, "error": "no_keyboard",
+                         "hint": ("No soft keyboard is up — RETURN " +
+                                  "requires a focused text input. TAP " +
+                                  "an input first, then RETURN.")])
+                    break
+                }
+                app.typeText("\n")
                 waitForSettle(app, timeout: 0.5)
                 sendResponse(connection, ["ok": true])
 
@@ -3522,6 +3734,73 @@ class SIBBServer: XCTestCase {
                     "bundle": bundle,
                 ])
 
+            case "pinch":
+                // Two-finger pinch gesture. Primary use: recover from
+                // iOS Safari's auto-zoom on input focus (the page can
+                // stay zoomed even after the agent dismisses kb / leaves
+                // app, so PINCH out is the only reliable reset confirmed
+                // empirically — see IOS_SIM_QUIRKS §21).
+                //
+                // Target priority:
+                //   1. The first WebView, if present (Safari/SFSafariView
+                //      WKWebView container — its scrollView holds the
+                //      zoom recognizer; targeting the whole-app frame
+                //      while an input is focused gets the gesture
+                //      captured by the input element instead).
+                //   2. The first scrollView, if no WebView (covers
+                //      Maps / Photos and other native scroll surfaces).
+                //   3. The whole-app frame as a last resort.
+                //
+                // Scale > 1 zooms IN, scale < 1 zooms OUT. Velocity is
+                // in scale/second. iOS' gesture recognizer expects a
+                // "natural" pace — too slow (velocity ~1) sometimes
+                // fails to register as a real pinch. Default velocity
+                // raised to 3.0 to make the gesture pass iOS' recognizer.
+                guard let app = currentApp else {
+                    sendResponse(connection,
+                        ["ok": false, "error": "no_app"]); break
+                }
+                let scale = (cmdDict["scale"] as? Double) ?? 0.5
+                let velocity = (cmdDict["velocity"] as? Double) ?? 3.0
+                // `repeats` controls how many pinches to fire in a row
+                // (default 1). iOS's gesture recognizer occasionally
+                // doesn't register a single synthetic pinch as a "real"
+                // gesture; 3 fast successive pinches reliably trigger
+                // the WKWebView scrollView's zoom recognizer. The agent
+                // can override via `repeats` in the command payload.
+                let repeats = (cmdDict["repeats"] as? Int) ?? 3
+                var target = "app"
+                SIBBSafeRun(nil) {
+                    // `descendants(matching:)` searches the WHOLE tree,
+                    // not just first-level children — Safari's WebView
+                    // is nested under a window + several other layers
+                    // so `app.webViews.firstMatch` may fail to locate
+                    // it without the descendant query.
+                    let web = app.descendants(matching: .webView)
+                                  .firstMatch
+                    let sv  = app.descendants(matching: .scrollView)
+                                  .firstMatch
+                    let chosen: XCUIElement
+                    if web.exists {
+                        chosen = web; target = "webView"
+                    } else if sv.exists {
+                        chosen = sv; target = "scrollView"
+                    } else {
+                        chosen = app; target = "app"
+                    }
+                    for _ in 0..<max(1, repeats) {
+                        chosen.pinch(withScale: CGFloat(scale),
+                                     velocity: CGFloat(velocity))
+                    }
+                }
+                waitForSettle(app)
+                sendResponse(connection, [
+                    "ok": true,
+                    "scale": scale,
+                    "velocity": velocity,
+                    "target": target,
+                ])
+
             case "press":
                 // Hardware buttons / system gestures. Drives at the device or
                 // app coordinate level — currentApp is only needed as a
@@ -3647,6 +3926,89 @@ class SIBBServer: XCTestCase {
                         before: Date().addingTimeInterval(0.05))
                 }
                 sendResponse(connection, result)
+
+            case "system_now":
+                // Returns the sim's current date/time + timezone +
+                // weekday. Reads Date()/Calendar.current/TimeZone.current
+                // inside the simulator process so the agent sees the
+                // SIM's clock (not the host Mac's wall clock, in case
+                // the sim has a time override).
+                //
+                // Used by the API agent to discover today's date —
+                // without it, models hallucinate dates and fail tasks
+                // that ask for "tomorrow" or "next Monday." The UI
+                // agent gets this for free by reading the Springboard
+                // status bar.
+                let now = Date()
+                let iso = ISO8601DateFormatter()
+                iso.formatOptions = [.withInternetDateTime]
+                let cal = Calendar.current
+                let comps = cal.dateComponents(
+                    [.year, .month, .day, .hour, .minute, .second,
+                     .weekday],
+                    from: now)
+                let weekdayNames = ["", "Sunday", "Monday", "Tuesday",
+                                    "Wednesday", "Thursday", "Friday",
+                                    "Saturday"]
+                let localFmt = DateFormatter()
+                localFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+                localFmt.timeZone = TimeZone.current
+                sendResponse(connection, [
+                    "ok": true,
+                    "datetime_iso": iso.string(from: now),
+                    "datetime_local": localFmt.string(from: now),
+                    "date": String(format: "%04d-%02d-%02d",
+                                    comps.year ?? 0, comps.month ?? 0,
+                                    comps.day ?? 0),
+                    "year": comps.year ?? 0,
+                    "month": comps.month ?? 0,
+                    "day": comps.day ?? 0,
+                    "weekday": weekdayNames[comps.weekday ?? 0],
+                    "timezone": TimeZone.current.identifier,
+                    "timezone_offset_seconds":
+                        TimeZone.current.secondsFromGMT(),
+                ])
+
+            case "system_locale":
+                // Returns the sim's locale settings: language, region,
+                // currency, first day of the week, measurement system.
+                // Relevant for tasks that depend on locale-specific
+                // behavior (Reminders' first day of week affects
+                // recurrence; Contacts' postal format varies by region).
+                let loc = Locale.current
+                var langCode: String = "und"
+                var regionCode: String = "ZZ"
+                if #available(iOS 16, *) {
+                    langCode = loc.language.languageCode?.identifier
+                        ?? "und"
+                    regionCode = loc.region?.identifier ?? "ZZ"
+                } else {
+                    langCode = loc.languageCode ?? "und"
+                    regionCode = loc.regionCode ?? "ZZ"
+                }
+                let measurement: String
+                if #available(iOS 16, *) {
+                    switch loc.measurementSystem {
+                    case .us:     measurement = "us"
+                    case .uk:     measurement = "uk"
+                    case .metric: measurement = "metric"
+                    default:      measurement = "metric"
+                    }
+                } else {
+                    measurement = "metric"
+                }
+                sendResponse(connection, [
+                    "ok": true,
+                    "identifier": loc.identifier,
+                    "language": langCode,
+                    "region": regionCode,
+                    "first_day_of_week": Calendar.current.firstWeekday,
+                    "measurement_system": measurement,
+                    "uses_24_hour":
+                        DateFormatter.dateFormat(
+                            fromTemplate: "j", options: 0,
+                            locale: loc)?.contains("H") ?? true,
+                ])
 
             case "quit":
                 sendResponse(connection, ["ok": true])
@@ -3793,7 +4155,7 @@ echo "Generating Xcode project..."
 xcodegen generate
 
 echo "Building SIBBHelper..."
-UDID="${1:-19B95A95-614A-4ECA-B943-44FDADFD7A9F}"
+UDID="${1:?usage: $0 <simulator-UDID>   (run `xcrun simctl list devices` to find one)}"
 echo "Building for simulator: $UDID"
 
 xcodebuild build-for-testing \

@@ -27,7 +27,7 @@ import subprocess
 import hashlib
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 from enum import Enum
 
 
@@ -301,6 +301,196 @@ XCUITEST_ROLE_MAP: dict = {
 }
 
 
+# ─── helpers used by AXReader._read_xcuitest ─────────────────────────
+#
+# Module-level (not nested) so they're easy to unit-test against
+# synthetic AX inputs without standing up the full reader.
+
+# Labels that identify iOS Safari chrome elements. Used to derive
+# chrome-region y-bounds from the live AX (instead of hardcoding pixel
+# thresholds tuned for one device + orientation). Match is
+# case-insensitive against `effective_label`.
+#
+# NOTE on localization: these are English literals. Non-en_US sims
+# would silently miss matches. The lookup is now GATED behind role +
+# geometric checks (see `_derive_chrome_bounds`), so even when locale
+# changes shift the labels out, the role/geometry path still catches
+# the chrome — at the cost of being slightly less precise. We're
+# accidentally safe today because prewarm pins en_US (task #163).
+_SAFARI_TOP_CHROME_LABELS = frozenset({
+    # iOS Safari's top status / tab strip — present on some iOS
+    # versions, absent on others. The kept set is intentionally narrow:
+    # we want false negatives (filter shows more) over false positives
+    # (filter shows less).
+})
+_SAFARI_BOTTOM_CHROME_LABELS = frozenset({
+    "address",      # URL bar — primary anchor when kb is down
+})
+# Pruned 2026-06-06 (Step 3): "previous", "next", "done", "typing
+# predictions" — these were treated as chrome so the chrome region
+# extended up past them, shrinking the agent's usable area. After
+# Step 3, the keyboard accessory bar's elements (Previous/Next/Done/
+# predictions) are AGENT-VISIBLE INTERACTIVE UI (Done dismisses kb,
+# Next/Previous walk form focus, predictions autofill). Treating them
+# as chrome is wrong now. Form fields behind them are still filtered
+# by the bare `kb_frame.y` occlusion check.
+#
+# Pruned earlier: "toolbar" and "tab bar" — tall toolbar containers
+# rejected by height ≤ 60 gate; Safari tab bar is a top strip
+# rejected by position guard.
+
+# Role keys that may legitimately appear inside the bottom chrome strip
+# (URL bar wrapper or keyboard accessory toolbar). Used by
+# `_derive_chrome_bounds` to gate label-only matches behind a role
+# check. Plain text or status elements with the label "Done" elsewhere
+# in the app are rejected by this gate.
+#
+# CRITICAL: `_derive_chrome_bounds` runs against `xc_tree.elements`
+# which carry raw lowercase XCUITest role strings (`"btn"`, `"input"`,
+# `"toolbar"`, ...) — they have NOT been mapped through
+# XCUITEST_ROLE_MAP yet. We also want unit-test fixtures that set
+# `effective_role` to an `ElementRole` enum value to keep working.
+# `_chrome_role_key` normalizes both forms to a lowercase string we
+# compare against this set.
+_BOTTOM_CHROME_ROLE_KEYS = frozenset({
+    "btn", "button",        # XCUITest "btn" / ElementRole.BUTTON
+    "input", "textfield",   # XCUITest "input" / ElementRole.TEXT_FIELD
+    "search",               # XCUITest "search" (URL bar variant)
+    "toolbar",
+    "other",                # accessory wrapper role is unstable
+})
+
+
+def _chrome_role_key(role) -> "str | None":
+    """Normalize a role value to the form stored in
+    `_BOTTOM_CHROME_ROLE_KEYS`. Accepts None, a raw lowercase XCUITest
+    string (production path — chrome bounds run before role mapping),
+    or an `ElementRole` enum (test fixtures, future inversion). Returns
+    None when no role info is available (caller treats this as a
+    backward-compat pass-through)."""
+    if role is None:
+        return None
+    if hasattr(role, "value"):
+        return str(role.value).lower()
+    return str(role).lower()
+
+
+# A bottom-chrome element must be physically short — keyboard accessory
+# bars are a single row (~44 px nominal). 60 px gives ample headroom
+# for landscape variants without admitting full-height controls that
+# happen to share a label.
+#
+# Cross-language note: the Swift side (`gatherAccessory` in
+# `sibb_xcuitest_setup.sh`) uses TWO thresholds — `< 50` for accessory
+# BUTTONS (Done / Next / Previous, individually tappable, fixed 44 px
+# nominal) and `< 60` for the predictive-bar WRAPPER (`.other` role,
+# typically slightly taller). Python's `_derive_chrome_bounds` operates
+# at the COARSER granularity of "is this labeled element part of the
+# bottom chrome strip at all", so the looser 60-px ceiling matches both
+# Swift gates. If the Swift gates ever tighten further, mirror them
+# here. Drift here is asymmetric — Swift is the producer, Python the
+# consumer.
+_BOTTOM_CHROME_MAX_HEIGHT = 60.0
+
+
+
+
+def _derive_chrome_bounds(
+        elements, kb_y_top, screen_w, screen_h
+) -> "tuple[float, float]":
+    """Return `(top_chrome_bottom, bottom_chrome_top)` derived from
+    the LIVE AX, falling back to safe defaults if nothing identifies
+    as chrome.
+
+    * top_chrome_bottom: y below which an element is considered top-
+      chrome. Derived from the max-bottom of small AX text elements
+      sitting in the top ~80px (status bar / tab strip). Defaults to
+      50px when nothing matches.
+    * bottom_chrome_top: y above which an element is considered
+      bottom-chrome (URL bar / toolbar / keyboard / accessory bar).
+      Derived from the URL bar (label "Address") top if present,
+      else the keyboard top if visible, else `screen_h - 100`.
+
+    NOTE: this is INTENTIONALLY conservative. Top-chrome defaults to
+    a small strip; bottom-chrome only shrinks when we have positive
+    evidence. Over-filtering hurts the agent (it hides usable
+    elements); under-filtering only loses the safety net the
+    coord-zoomed branch wants. Erring under-filtering.
+    """
+    # ── top chrome ──
+    top_chrome_bottom = 50.0  # safe default — status bar area
+    for e in elements:
+        fr = getattr(e, "frame", None)
+        if fr is None:
+            continue
+        # Treat any small text/image near y=0 as status-bar candidate.
+        if fr.y < 60 and fr.height < 40:
+            top_chrome_bottom = max(
+                top_chrome_bottom, fr.y + fr.height + 5.0)
+    top_chrome_bottom = min(top_chrome_bottom, screen_h * 0.15)
+
+    # ── bottom chrome ──
+    bottom_chrome_top = screen_h - 100.0  # safe default
+    label_match_min = None
+    for e in elements:
+        lbl = (getattr(e, "label", None) or "").strip().lower()
+        if not lbl:
+            continue
+        fr = getattr(e, "frame", None)
+        if fr is None:
+            continue
+        if lbl not in _SAFARI_BOTTOM_CHROME_LABELS:
+            continue
+        # Gate the label match behind role + geometric checks. A "Done"
+        # button on a sheet confirmation, a "Next" label on a tutorial,
+        # or a tall toolbar elsewhere in the app must NOT shrink the
+        # usable area. Real keyboard-accessory chrome is short, sits
+        # above the keyboard top (orientation-independent), and has one
+        # of the expected roles.
+        role_key = _chrome_role_key(getattr(e, "effective_role", None))
+        if role_key is not None and role_key not in _BOTTOM_CHROME_ROLE_KEYS:
+            continue
+        if fr.height > _BOTTOM_CHROME_MAX_HEIGHT:
+            continue
+        # Position guard. Prefer kb_y_top (orientation-independent and
+        # tight: chrome must sit ABOVE the keyboard). When kb_y_top is
+        # unknown — kb is dismissed or hasn't been polled yet — fall
+        # back to the bottom-half heuristic, which catches the URL bar
+        # case (Safari portrait has URL bar at y ~ 0.92 * screen_h).
+        if kb_y_top is not None:
+            if fr.y >= kb_y_top:
+                continue
+        else:
+            if fr.y < screen_h * 0.5:
+                # In portrait, an "Address" / "Done" in the upper half
+                # is never the keyboard's accessory or the URL bar.
+                continue
+        if label_match_min is None or fr.y < label_match_min:
+            label_match_min = fr.y
+    candidates = [v for v in (label_match_min, kb_y_top) if v is not None]
+    if candidates:
+        bottom_chrome_top = min(min(candidates) - 5.0, bottom_chrome_top)
+
+    # Sanity clamp: top must stay above bottom (degenerate small
+    # screens). The earlier `middle = screen_h * 0.5` floor was too
+    # aggressive when the keyboard is up — in landscape iPhone the kb
+    # genuinely covers >50% of the screen, so the legitimate bottom-
+    # chrome region (kb + accessory) can extend well above the half-
+    # screen mark. Clamping bottom UP to `middle + 1` would then mis-
+    # classify the kb area as "middle/content".
+    #
+    # New strategy:
+    #   * top_chrome_bottom stays bounded by a small fraction of screen
+    #     (`screen_h * 0.15` upstream), so it can't run away.
+    #   * bottom_chrome_top is left as-is when there's positive evidence
+    #     (label match OR kb signal). If absolutely nothing identified
+    #     bottom chrome, fall back to the `screen_h - 100` default.
+    #   * Only enforce the non-inversion invariant: bottom > top.
+    if bottom_chrome_top <= top_chrome_bottom:
+        bottom_chrome_top = top_chrome_bottom + 1.0
+    return top_chrome_bottom, bottom_chrome_top
+
+
 class AXReader:
     """
     Fetches the full accessibility tree from a simulator.
@@ -320,6 +510,13 @@ class AXReader:
         self._xcuitest     = None
         self._using_xctest = False
         self._ref_counter  = 0
+        # No cross-snapshot state. Zoom detection is per-frame
+        # (computed fresh from kb_above_screen + Swift zoom_scale
+        # signals). Step 4 (2026-06-07) dropped the latch — empirical
+        # probe showed signals are stable across consecutive frames,
+        # and the previously-load-bearing overflow heuristic was a
+        # false positive on every Safari page with content wider than
+        # the viewport (i.e. nearly all of them).
 
     def _next_ref(self) -> str:
         self._ref_counter += 1
@@ -399,9 +596,95 @@ class AXReader:
         # has scrolled it under the keyboard or partially off-screen.
         kb_frame = getattr(xc_tree, "keyboard_frame", None)
         kb_y_top = kb_frame.get("y") if kb_frame else None
+        # NOTE (2026-06-06): the accessory bar (predictive text strip
+        # + `Previous`/`Next`/`Done` toolbar) used to be unioned into
+        # `kb_y_top` so the visibility filter ALSO rejected elements
+        # behind the bar. Empirical probe
+        # (`sibb_probe_autozoom_lifecycle.py`) proved the bar's elements
+        # are first-class labeled buttons in the AX tree — tapping
+        # `Done` dismisses the kb, `Next`/`Previous` walk form focus,
+        # prediction words autofill. The agent should SEE and USE them.
+        # We keep `accessory_bar_frame` on the tree for diagnostics but
+        # no longer use it for occlusion. Form fields BEHIND the bar
+        # are still rejected by being below the bare `kb_frame.y` —
+        # they ARE genuinely occluded by the kb itself.
+        acc_frame = getattr(xc_tree, "accessory_bar_frame", None)
         screen_w = getattr(xc_tree, "screen_width", 402)
         screen_h = getattr(xc_tree, "screen_height", 874)
+        # WKWebView zoom scale, if Swift exposed it via KVC on the
+        # underlying scrollView. 1.0 = unzoomed. None = unknown (older
+        # SIBBHelper builds, or non-Safari context). When known, this
+        # is the AUTHORITATIVE zoom signal; the heuristics below are
+        # fallbacks.
+        zoom_scale_swift = getattr(xc_tree, "zoom_scale", None)
         TOL = 1.0   # px tolerance for AX rounding error
+
+        # ─── orientation ───────────────────────────────────────────────
+        # Derived from runtime screen dims rather than queried — Swift
+        # already reports the rotated `app.frame`, so screen_w / screen_h
+        # implicitly carry the orientation. Exposed on the tree so the
+        # tokenizer header and downstream filters can branch.
+        orientation = "landscape" if screen_w > screen_h else "portrait"
+
+        # ─── auto-zoom detection (per-frame, stateless) ───────────────
+        # iOS Safari auto-zooms when the user focuses an input whose
+        # computed font-size is < 16px. We surface this as an
+        # informational `AUTO-ZOOMED` tag in the observation header
+        # so the agent knows to use `DOUBLE_TAP` to reset.
+        #
+        # Step 4 (2026-06-07) — design history:
+        # - The previous design used a 3-signal cascade (Swift
+        #   zoom_scale > overflow heuristic > kb_above_screen) with a
+        #   2-snapshot release latch on `AXReader`.
+        # - Empirical probe (`sibb_probe_autozoom_lifecycle.py`,
+        #   2026-06-06) showed signals are STABLE across consecutive
+        #   frames — no flicker. The latch was solving a problem that
+        #   didn't exist.
+        # - The same probe showed the overflow heuristic is a FALSE
+        #   POSITIVE on every Safari page with content wider than the
+        #   viewport: baseline state (no zoom) reported max_w/screen_w
+        #   = 1.60 because the WebView exposes off-viewport content
+        #   at full content width. Overflow as a zoom signal is dead.
+        # - The Swift `zoom_scale` KVC probe is a placeholder
+        #   (never populated yet); the `kb_above_screen` signal hasn't
+        #   been observed firing. So zoom detection is effectively
+        #   always False today. That's HONEST — when the agent
+        #   experiences a zoom problem, they use DOUBLE_TAP defensively
+        #   rather than trusting a header tag we can't reliably set.
+        if zoom_scale_swift is not None and zoom_scale_swift > 1.0 + 0.05:
+            coord_system_zoomed = True
+            zoom_factor = float(zoom_scale_swift)
+            zoom_source = "swift"
+        elif kb_y_top is not None and kb_y_top > screen_h + TOL:
+            coord_system_zoomed = True
+            zoom_factor = None
+            zoom_source = "kb_above_screen"
+        else:
+            coord_system_zoomed = False
+            zoom_factor = (
+                float(zoom_scale_swift)
+                if zoom_scale_swift is not None else 1.0)
+            zoom_source = None
+
+        # ─── chrome detection (runtime-derived) ────────────────────────
+        # The previous version used fixed pixel thresholds (50 px top /
+        # screen_h - 100 px bottom) tuned for iPhone 16 portrait. That
+        # silently breaks in landscape (screen_h≈402 → cutoff=302 sweeps
+        # in form-field y-coords) and on differently-sized devices
+        # (SE / Pro Max / iPad have different chrome strips).
+        #
+        # Instead, derive chrome bounds from observable AX elements:
+        #   * top_chrome_bottom: max y of any status-bar-like element
+        #     (label is a time-of-day pattern, or role is `text` with
+        #     small height near y=0). Falls back to 50px.
+        #   * bottom_chrome_top: min y of the URL bar (label "Address"
+        #     in Safari) or the keyboard top, whichever is higher up.
+        #     Falls back to screen_h - 100.
+        # Bounds are computed once per snapshot; surfaced on the tree so
+        # downstream diagnostics (turn-log JSONL) can record what the
+        # chrome derivation decided this frame.
+        top_chrome_bottom, bottom_chrome_top = _derive_chrome_bounds(
+            xc_tree.elements, kb_y_top, screen_w, screen_h)
 
         def _is_fully_visible(frame) -> bool:
             """True iff the element's entire frame is within the
@@ -460,6 +743,21 @@ class AXReader:
                     viewport_filtered_count += 1
                 continue
 
+            # Note (2026-06-06): an earlier version of this block
+            # filtered ALL non-chrome elements when zoom was detected,
+            # on the theory that AX coords are in zoomed-doc space and
+            # would mis-tap. That theory turned out to be wrong —
+            # screenshot overlay (`sibb_probe_pinch_recovery.py`)
+            # confirmed AX element frames are in real screen coords
+            # even when auto-zoomed. Elements that extend past the
+            # screen edges (e.g. a 563-wide form on a 402 screen) are
+            # iOS reporting their FULL extent; the visible portion is
+            # tappable at the reported center, and the existing
+            # `_is_fully_visible` filter above correctly drops the
+            # ones whose entire frame falls outside the viewport.
+            # Zoom detection stays as an informational signal in the
+            # observation header, but no further filtering.
+
             el = AXElement(
                 ref=self._next_ref(),
                 label=xc_el.label,
@@ -490,6 +788,33 @@ class AXReader:
         tree.keyboard_frame = kb_frame
         tree.kb_filtered_count = kb_filtered_count
         tree.viewport_filtered_count = viewport_filtered_count
+        # Surface the zoomed-coord-system detection so the tokenizer
+        # can warn the agent (the AX is intentionally sparse in this
+        # state — they need to dismiss the keyboard or scroll to
+        # restore the unzoomed coord system).
+        tree.coord_system_zoomed = coord_system_zoomed
+        tree.zoom_factor = zoom_factor
+        tree.zoom_source = zoom_source
+        # Orientation derived from runtime screen dims.
+        tree.orientation = orientation
+        # Keyboard-top y (= `kb_frame.y` when kb visible, else None).
+        # As of 2026-06-06 this is NO LONGER unioned with the accessory
+        # bar — the bar's elements are agent-visible interactive surfaces
+        # (Done/Next/Previous/predictions). Replay's pre-tap occlusion
+        # guard still consumes this field; semantics unchanged for it.
+        tree.keyboard_y_min = kb_y_top
+        # Accessory-bar frame kept for diagnostics (JSONL post-hoc).
+        # No longer load-bearing for filter decisions; informational only.
+        tree.accessory_bar_frame = acc_frame
+        # Derived chrome bounds — useful for post-hoc debugging of
+        # "why did element X get filtered" questions in the JSONL log.
+        tree.top_chrome_bottom = top_chrome_bottom
+        tree.bottom_chrome_top = bottom_chrome_top
+        # Backend marker for JSONL analysts: the IDB fallback path
+        # (_read_idb) doesn't populate orientation / zoom / kb-filter
+        # fields. Without this marker, an IDB-backed turn looks
+        # indistinguishable from a Safari turn with no signal at all.
+        tree.ax_backend = "xcuitest"
         return tree
 
     async def _read_idb(self, use_cache_ms: float = 0) -> AXTree:
@@ -517,6 +842,11 @@ class AXReader:
             root = self._parse_element(raw, elements_flat)
 
         tree = AXTree(elements=elements_flat, root=root, udid=self.udid)
+        # Backend marker (see _read_xcuitest equivalent). IDB-backed
+        # trees lack the orientation / zoom / kb-filter diagnostics —
+        # this lets the assistant's JSONL distinguish them from a
+        # Safari turn that simply had no signal.
+        tree.ax_backend = "idb"
         self._cache[tree_hash] = (tree, time.time() * 1000)
         return tree
 
@@ -1095,7 +1425,7 @@ class AgentAction:
     """
     The action the LLM wants to take. Parsed from the LLM's output.
     """
-    action_type: str      # "tap" | "type" | "scroll" | "adjust" | "swipe" | "press" | "done" | "fail" | "answer"
+    action_type: str      # "tap" | "double_tap" | "type" | "scroll" | "adjust" | "swipe" | "press" | "done" | "fail" | "answer" | "pinch" | "fling" | "clear" | "observe"
     target_ref:  Optional[str]   = None    # @e042
     target_label: Optional[str]  = None    # fallback if ref not found
     target_x:    Optional[float] = None    # raw coordinate tap (no element lookup)
@@ -1104,6 +1434,12 @@ class AgentAction:
     direction:    Optional[str]  = None    # for "scroll"/"swipe": up/down/left/right
     amount:       float           = 1.0    # for "scroll": pages; for "adjust": steps
     reason:       Optional[str]  = None    # for "fail"/"done"
+    # `raw_verb` records the literal verb the agent emitted, BEFORE any
+    # aliasing or translation. SCROLL_PAGE dispatches as `action_type=
+    # "swipe"` with an inverted direction; without raw_verb the JSONL
+    # can't distinguish a genuine SWIPE from a SCROLL_PAGE. Set in the
+    # parser branch; downstream may emit it next to action_type.
+    raw_verb:     Optional[str]  = None
     # ANSWER terminal carries a structured JSON object payload. The
     # generator declares the expected shape in the per-task instruction;
     # the verifier reads `answer_payload` via the `agent.answer` resource
@@ -1440,6 +1776,17 @@ class SIBBScaffold:
         )
 
     def parse_action(self, llm_output: str) -> AgentAction:
+        """Parse the LLM's action output into an AgentAction. Records
+        the literal verb the agent emitted on `action.raw_verb` so the
+        JSONL can distinguish aliased verbs (SCROLL_PAGE → swipe) from
+        their canonical dispatch."""
+        self._last_parsed_verb = None
+        action = self._parse_action_impl(llm_output)
+        if action is not None and action.raw_verb is None:
+            action.raw_verb = self._last_parsed_verb
+        return action
+
+    def _parse_action_impl(self, llm_output: str) -> AgentAction:
         """
         Parse the LLM's action output into an AgentAction.
 
@@ -1467,8 +1814,11 @@ class SIBBScaffold:
         # the first line and silently misparsed reasoning. The first-
         # line fallback is preserved for callers (like human replay)
         # that pass a single bare action.
-        _VERBS = {"TAP", "TYPE", "CLEAR", "SCROLL", "FLING", "ADJUST",
-                   "SWIPE", "PRESS", "OBSERVE",
+        _VERBS = {"TAP", "DOUBLE_TAP", "TYPE", "CLEAR",
+                   "SCROLL", "SCROLL_PAGE",
+                   "FLING", "ADJUST",
+                   "SWIPE", "PRESS", "PINCH", "OBSERVE",
+                   "RETURN",
                    "DONE", "FAIL", "ANSWER", "CLARIFY"}
         # English-ambiguous verbs: also common English words. Require
         # exact uppercase to avoid false-positives on reasoning prose
@@ -1484,20 +1834,59 @@ class SIBBScaffold:
             return AgentAction(action_type="fail",
                                 reason="Empty LLM output")
         line = raw_lines[0]
-        for candidate in reversed(raw_lines):
-            cand_parts = candidate.split()
+        # Step 5L-D (2026-06-08) — flag the multi-action emission
+        # pattern. Walk every line and tag it as either a "verb-line"
+        # (first token is a known verb) or "prose". If we find 2+
+        # CONSECUTIVE verb-lines (no prose between), that's a true
+        # multi-action turn — the LLM intended to fire them in
+        # sequence. Reject loudly so the agent fixes its emission.
+        #
+        # If verb-lines are separated by prose, treat as self-
+        # correction ("TAP @x\nActually let me ANSWER...") and keep
+        # the prior "last verb wins" behavior — that pattern is
+        # common in well-behaved LLM reasoning.
+        line_kinds: List[Tuple[str, str]] = []  # (kind, line)
+        for cand in raw_lines:
+            cand_parts = cand.split()
             if not cand_parts:
                 continue
             first_upper = cand_parts[0].upper()
-            if first_upper not in _VERBS:
-                continue
-            # Ambiguous verbs need exact uppercase as the line's first
-            # token. Action verbs accept any case.
-            if (first_upper in _AMBIGUOUS_VERBS
-                    and cand_parts[0] != first_upper):
-                continue
-            line = candidate
-            break
+            is_verb_line = (
+                first_upper in _VERBS
+                and not (first_upper in _AMBIGUOUS_VERBS
+                          and cand_parts[0] != first_upper))
+            line_kinds.append(
+                ("verb", cand) if is_verb_line else ("prose", cand))
+        # Detect a consecutive verb-line run of length >= 2.
+        consecutive_verbs: List[str] = []
+        run: List[str] = []
+        for kind, _line in line_kinds:
+            if kind == "verb":
+                run.append(_line)
+            else:
+                if len(run) >= 2:
+                    consecutive_verbs = run
+                    break
+                run = []
+        if len(run) >= 2 and not consecutive_verbs:
+            consecutive_verbs = run
+        if consecutive_verbs:
+            verbs_emitted = [
+                l.split()[0].upper() for l in consecutive_verbs]
+            return AgentAction(
+                action_type="fail",
+                reason=(
+                    "Multi-action turn detected — emit EXACTLY ONE "
+                    f"action per response. Saw "
+                    f"{len(consecutive_verbs)} consecutive verb-lines: "
+                    f"{verbs_emitted}. Pick one and re-issue. The "
+                    "runner will NOT silently execute only the last "
+                    "one (the prior dropped-on-the-floor behavior)."))
+        # Otherwise: gather verb-line candidates (possibly interleaved
+        # with prose). Pick the LAST one as the chosen action.
+        action_candidates = [l for k, l in line_kinds if k == "verb"]
+        if action_candidates:
+            line = action_candidates[-1]
         else:
             # No line *starts* with a verb. Fall back to scanning the
             # last line for the last occurrence of a verb word anywhere
@@ -1508,8 +1897,13 @@ class SIBBScaffold:
             # Two regexes: action verbs are case-insensitive (LLMs
             # may emit lowercase mid-sentence); ambiguous verbs are
             # uppercase-only to block English-prose false-positives.
+            # Longest-first so `SCROLL_PAGE` beats `SCROLL` in the
+            # alternation (regex picks the first matching alternative,
+            # not the longest).
             action_re = re.compile(
-                r"\b(" + "|".join(_ACTION_VERBS) + r")\b",
+                r"\b(" + "|".join(
+                    sorted(_ACTION_VERBS, key=len, reverse=True))
+                + r")\b",
                 re.IGNORECASE)
             ambig_re = re.compile(
                 r"\b(" + "|".join(_AMBIGUOUS_VERBS) + r")\b")
@@ -1521,6 +1915,11 @@ class SIBBScaffold:
                 line = last[m.start():]
         parts = line.split()
         verb = parts[0].upper()
+        # Stash the actual scanned verb so the wrapper can attach it as
+        # raw_verb on the returned AgentAction. The scan above picks the
+        # LAST recognized verb on the LAST non-empty line — same logic
+        # the dispatch below uses — so this matches reality.
+        self._last_parsed_verb = verb
 
         def extract_ref(tokens):
             for t in tokens:
@@ -1543,6 +1942,30 @@ class SIBBScaffold:
             cx, cy = extract_coord(line)
             return AgentAction(
                 action_type="tap",
+                target_ref=extract_ref(parts[1:]),
+                target_label=extract_quoted(line),
+                target_x=cx,
+                target_y=cy,
+            )
+        elif verb == "DOUBLE_TAP":
+            # Coordinate-based double-tap. Dispatches through XCUITest's
+            # native gesture pipeline (XCUICoordinate.doubleTap()), which
+            # is the path that fires WebKit's double-tap-to-zoom
+            # recognizer. Two rapid TAPs do NOT — verified empirically
+            # (see IOS_SIM_QUIRKS §21).
+            #
+            # PRIMARY USE: reset Safari's auto-zoom after input focus.
+            # The agent emits `DOUBLE_TAP (x, y)` on a non-input page
+            # region; WebKit's recognizer zooms the WebView back to fit-
+            # page. Also useful on Maps (zoom-in) and Photos (fit toggle).
+            #
+            # Grammar matches TAP exactly:
+            #   DOUBLE_TAP @e042             — by ref
+            #   DOUBLE_TAP (200, 400)        — by coord
+            #   DOUBLE_TAP "Heading"         — by label (case-insensitive substring)
+            cx, cy = extract_coord(line)
+            return AgentAction(
+                action_type="double_tap",
                 target_ref=extract_ref(parts[1:]),
                 target_label=extract_quoted(line),
                 target_x=cx,
@@ -1659,6 +2082,103 @@ class SIBBScaffold:
                 target_ref=extract_ref(parts[1:]),
                 direction=direction,
             )
+        elif verb == "SCROLL_PAGE":
+            # Content-direction page scroll — a semantic synonym for
+            # SWIPE that maps to the iOS-correct finger direction.
+            # iOS SWIPE's `direction` is the FINGER direction (e.g.
+            # SWIPE down = finger moves down = content moves down with
+            # the finger = page actually scrolls UP). LLMs reliably
+            # confuse this with "I want to scroll the page down" and
+            # emit SWIPE down to see lower content, then loop when it
+            # doesn't work (the clipped-button benchmark surfaced this:
+            # Gemini emitted 17 consecutive `SWIPE down` for a task
+            # that needed `SWIPE up`).
+            #
+            # SCROLL_PAGE takes CONTENT direction:
+            #   SCROLL_PAGE down   → see lower content → emits SWIPE up
+            #   SCROLL_PAGE up     → see higher content → emits SWIPE down
+            #   SCROLL_PAGE right  → see content to the right → SWIPE left
+            #   SCROLL_PAGE left   → see content to the left → SWIPE right
+            #
+            # Optional amount (parity with SCROLL): `SCROLL_PAGE down 3`
+            # repeats the swipe 3 times. Defaults to 1.
+            content_dir = None
+            amount = None
+            for p in parts[1:]:
+                low = p.lower()
+                if low in ("up", "down", "left", "right"):
+                    content_dir = low
+                    continue
+                if amount is None:
+                    try:
+                        amount = float(p)
+                    except ValueError:
+                        pass
+            # Default to "down" (most common — agent wants to see more
+            # content below the fold).
+            if content_dir is None:
+                content_dir = "down"
+            # Defensive: tolerate future direction additions without
+            # crashing. Unknown directions fall through to "up" (the
+            # finger direction that reveals content below), matching
+            # the default content-down case.
+            inverted = {
+                "up": "down", "down": "up",
+                "left": "right", "right": "left",
+            }.get(content_dir, "up")
+            return AgentAction(
+                action_type="swipe",
+                target_ref=extract_ref(parts[1:]),
+                direction=inverted,
+                amount=(amount if amount is not None else 1.0),
+            )
+        elif verb == "PINCH":
+            # Two-finger pinch. Accept:
+            #   PINCH out         — zoom out  (scale 0.5)
+            #   PINCH in          — zoom in   (scale 2.0)
+            #   PINCH <scale>     — explicit  (e.g. `PINCH 0.6`)
+            # Primary use: recover from iOS Safari's auto-zoom on
+            # input focus (the AUTO-ZOOMED tag in the obs header). Also
+            # general-purpose for Maps / Photos pinch interactions.
+            #
+            # `direction` field carries "out"/"in"; `amount` carries the
+            # explicit scale when the agent provided one (otherwise the
+            # executor maps direction → scale).
+            direction = None
+            scale = None
+            for p in parts[1:]:
+                low = p.lower()
+                if low in ("out", "in"):
+                    direction = low
+                    continue
+                # Try parse as float.
+                try:
+                    f = float(p)
+                    if f > 0 and f < 100:
+                        scale = f
+                except ValueError:
+                    pass
+            if direction is None and scale is None:
+                direction = "out"   # default = the canonical recovery
+            return AgentAction(
+                action_type="pinch",
+                direction=direction,
+                amount=scale if scale is not None else 1.0,
+            )
+        elif verb == "RETURN":
+            # `RETURN` — fire the Return key into the currently keyboard-
+            # focused element. Used to COMMIT a typed URL in Safari's URL
+            # bar, submit an in-app search, confirm a "name this" dialog,
+            # or submit a form on its last field. iOS dispatches the
+            # Return event against the focused field's configuration, so
+            # the same verb covers `Go` / `Search` / `Done` / `Next` /
+            # plain `Return` semantics without us labelling them.
+            #
+            # Argless on purpose: there's only one keyboard-focused
+            # element at a time, and `\n` flows through that focus.
+            # Compose with `TAP @ref` + `RETURN` on two turns if you need
+            # to focus first.
+            return AgentAction(action_type="return")
         elif verb == "OBSERVE":
             # `OBSERVE` / `OBSERVE <ms>` — pure no-op on the simulator's
             # state. Sleeps for `ms` (clamped to [0, 10000]) then returns,

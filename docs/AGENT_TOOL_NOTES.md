@@ -23,6 +23,25 @@ Append findings as we encounter them. Each note should describe what
 - The on-screen keyboard is filtered out of observations. Do not try
   to tap individual keys — always use `TYPE`.
 
+## DOUBLE_TAP
+
+- **Coordinate-based double-tap** via Swift's
+  `XCUICoordinate.doubleTap()` — the gesture path WebKit's
+  double-tap-to-zoom recognizer actually listens to. Two rapid
+  `xc.tap()` calls do NOT fire this recognizer (synthetic-event path
+  differs).
+- **Primary use**: reset Safari's auto-zoom after input focus. After
+  filling and dismissing the kb the page stays zoomed; emit
+  `DOUBLE_TAP (x, y)` on a non-input region (top quarter of the
+  viewport is almost always safe — heading or page chrome). WebKit
+  zooms to fit-page.
+- **For zoom reset, use coords** — `@ref` on a heading/link may
+  trigger selection or activation instead of zoom-fit. The grammar
+  accepts `@ref` and `"label"` forms for non-Safari uses like Maps
+  zoom-in or Photos fit-toggle.
+- Verified empirically (sim probe with real-trackpad double-tap +
+  user observation, 2026-06-06).
+
 ## TYPE
 
 - `TYPE @eXXXX "text"` — taps the target to focus, waits ~400 ms for
@@ -37,13 +56,17 @@ Append findings as we encounter them. Each note should describe what
   reveals more content below (which physically requires the finger to drag
   upward). `SCROLL up` reveals content above. Same for `left`/`right`.
   This matches every web/mobile scroll API (Selenium, Playwright, Appium).
-- **Element ref IS honored** as of D3. `SCROLL @e0033 down` scrolls
-  inside the element with frame `e0033` — useful for horizontal
-  carousels, embedded scroll views, map panning, and any nested
-  scrollable region that isn't the main app body. Gesture is bounded
+- **Element ref is REQUIRED as of 2026-06-03.** `SCROLL @e0033 down`
+  pans the element with ref `e0033` — typically a `[scroll]`,
+  `[table]`, `[collection]`, or `[web]` element. Gesture is bounded
   by the element's frame (80% of height/width, 10% inset from each
-  edge), so the swipe stays inside the element's hit area. Without a
-  ref, `SCROLL down` falls back to a whole-app swipe.
+  edge), so the swipe stays inside the element's hit area. **Bare
+  `SCROLL down` (no @ref) returns an error** — that's because
+  fixed-coordinate swipes can pass through chrome (URL bar, tab
+  strip, system gesture region) and iOS will treat them as
+  chrome interactions rather than content pans. For whole-screen
+  gestures (Spotlight, Control Center, page-flip, app switcher),
+  use SWIPE.
 - **`amount` = number of swipes**, default 1. `SCROLL down 3` does three
   swipes. Each swipe is roughly one screen-height of content (whole-app)
   or one element-height of content (when `@ref` is supplied).
@@ -61,16 +84,18 @@ Append findings as we encounter them. Each note should describe what
   - **Multiple `[scroll]` elements in one screen** → nested scrolls.
     Pick the innermost one whose frame contains the content you want
     to move, not the outermost (which scrolls the whole page).
-- **Picker wheels need `ADJUST`, not `SCROLL`.** Date/time pickers
-  expose `[pickerWheel]` role; use `ADJUST @ref up/down N` to nudge
-  the selection by N positions. Using `SCROLL` on a picker wheel
-  works but is imprecise.
-- **Scrollable but AX-invisible**: see "App-specific AX visibility
-  quirks" below. WKWebView page content (Safari), MKMapView panning
-  (Maps), and custom-drawn canvases have no AX-visible scroll
-  container. Use whole-app `SCROLL` (no ref) or `TAP (x, y)` with a
-  computed coordinate; element-targeted `SCROLL @ref` won't reach
-  inside these surfaces.
+- **Picker wheels: use `SCROLL @<pickerWheel-ref>` or `FLING @ref`.**
+  Date/time pickers expose `[pickerWheel]` (or `[adj]`) role; SCROLL
+  is precise (~1 tick per swipe), FLING is fast (~20–30 ticks). The
+  earlier `ADJUST` verb is deprecated.
+- **Safari WebView and Maps map ARE scrollable AX elements** —
+  WKWebView appears as `[web]`, MKMapView typically as `[scroll]` or
+  `[map]`. `SCROLL @<web-ref> down` pans the page; `SCROLL @<map-ref>`
+  pans the map. Element-targeted SCROLL works because each surface
+  has a non-zero frame in the AX tree. Custom-drawn canvases with NO
+  AX-visible scroll container can't be SCROLL'd — for those, the
+  agent uses TAP on visible affordances or falls through to ANSWER
+  with a "can't reach" rationale.
 
 ## SWIPE
 
@@ -91,6 +116,45 @@ Append findings as we encounter them. Each note should describe what
   - Pulling down Notification Center (whole-app `SWIPE down` from top)
   - Navigating between SpringBoard pages (whole-app `SWIPE left`/`right`)
   - Dismissing the app-switcher itself (whole-app `SWIPE up`)
+
+## SCROLL_PAGE (added 2026-06-06)
+
+- **Content-direction whole-page scroll** — semantic synonym for SWIPE
+  that takes the CONTENT direction the agent thinks in, and emits the
+  iOS-correct (opposite) finger direction internally:
+  - `SCROLL_PAGE down` → reveal lower content (emits SWIPE up)
+  - `SCROLL_PAGE up` → reveal higher content (emits SWIPE down)
+  - `SCROLL_PAGE right` → reveal content to the right (emits SWIPE left)
+  - `SCROLL_PAGE left` → reveal content to the left (emits SWIPE right)
+- **Optional repeat**: `SCROLL_PAGE down 3` does 3 swipes (parity with
+  SCROLL @ref). Capped at SCROLL_MAX_AMOUNT (20).
+- **When to use**: pages without a scrollable `@ref` exposed — the
+  canonical case is Safari WebView where the agent only sees inputs
+  and buttons. The benchmark surfaced LLMs reliably emitting
+  `SWIPE down` to mean "see lower content" and then looping when iOS
+  did the opposite; SCROLL_PAGE removes the confusion.
+- **Element-bounded** form also works: `SCROLL_PAGE @ref down` fires
+  an inverted swipe inside the ref's frame. The inversion still
+  applies — element content moves opposite to the finger too.
+- **Logged separately**: the JSONL turn record carries `raw_verb` so
+  post-hoc analysis can distinguish a real SWIPE from a SCROLL_PAGE
+  (both dispatch as `action_type=swipe`).
+
+## Observation header tags (added 2026-06-06)
+
+The header line above the AX list may carry two optional tags:
+
+- `LANDSCAPE` — device is rotated; coord origin still top-left but
+  width > height. Many generators were authored against portrait;
+  layouts will look different.
+- `AUTO-ZOOMED=<factor>x(<source>)` — Safari has auto-zoomed (typically
+  because an input with computed `font-size < 16px` got focus). AX
+  coords are STILL real screen coords; TAPs at reported coords hit.
+  Content may extend off the right; use `SCROLL_PAGE right` to reveal.
+  `(source)` is one of: `swift` (WKWebView KVC, most authoritative),
+  `overflow` (an AX element wider than the viewport), `kb_above_screen`
+  (kb frame reported above screen height). `PINCH out` may not reset
+  Safari WebView zoom — WebKit synthetic-gesture limitation.
 
 ## PRESS — hardware / gesture
 
@@ -250,8 +314,10 @@ To change state, the agent can:
 
 1. **`TAP @<Sheet Grabber>`** — toggles to the next state. The simplest
    action; one tap moves Collapsed → Half, another moves Half → Full.
-2. **`SCROLL up` (whole-app)** — usually expands the sheet to its
-   larger state, same effect as dragging the grabber up.
+2. **`SCROLL @<sheet-ref> up`** — find the `[scroll]` element that
+   IS the sheet (or its inner scroll view) and pan it up; usually
+   expands the sheet to its larger state, same effect as dragging
+   the grabber up. Bare `SCROLL up` (no @ref) errors.
 3. **`TAP` any input inside the sheet** (e.g. a search field) — many
    apps auto-expand the sheet to Full when their content is focused.
    This is the most "natural" path when the agent's goal is to search
@@ -306,7 +372,8 @@ WebKit / MapKit / UIKit-rendering limitation, not a SIBB bug.
        full screen and shows recents + suggestions), OR
     2. `TAP` the "Sheet Grabber" handle (toggles Collapsed → Half →
        Full), OR
-    3. `SCROLL up` on the sheet to expand it.
+    3. `SCROLL @<sheet-scroll-ref> up` on the sheet's inner scroll
+       view to expand it.
   Programmatically-added `MKAnnotation` pins do show up if labelled.
   Tasks should be designed around search-based navigation; when an
   observation in Maps looks too sparse, the most likely cause is the

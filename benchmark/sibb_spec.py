@@ -354,6 +354,36 @@ class MockSite(_SpecBase):
     # exercise non-default URLs.
     sign_in_path: str = "/login"
     sign_up_path: str = "/signup"
+    # ── Phase 4 harness: static-page templates (2026-06-05) ──────────
+    # `static_pages` maps a URL path → harness-page template NAME
+    # registered in `harness_layout.PAGE_REGISTRY`. We can't put a
+    # callable here directly because this dataclass is frozen and
+    # JSON-serializable; registering by name lets the apply path
+    # resolve the actual template fn at spawn time. Empty by default
+    # — only the signin/signup routes are served then.
+    static_pages: Dict[str, str] = field(default_factory=dict)
+    # Per-episode page seed. The MockSite renders each static-page
+    # template against a `random.Random` derived from this seed XOR'd
+    # with a stable digest of the path, so layouts are deterministic-
+    # per-(seed, path) and replayable. Default 0 — generators should
+    # set this from their episode seed for cross-episode variance.
+    page_seed: int = 0
+    # When `open_at_start=True`, override the start URL to a static-
+    # page path rather than the default `sign_in_path`. Use with
+    # `static_pages={"/event": "rsvp_event"}` + `start_path="/event"`
+    # for harness-page generators where the agent should land on
+    # the form page instead of a login form. None ⇒ open the login
+    # URL (legacy behavior).
+    start_path: Optional[str] = None
+    # Optional friendly hostname mapped to 127.0.0.1 via the sim's
+    # /etc/hosts. When set, the agent sees URLs like
+    # `http://aurora-conference.example:<port>/event` instead of
+    # `http://127.0.0.1:<port>/event`. SafariHandler appends the
+    # `127.0.0.1 <hostname>` line on apply and removes it on reset
+    # so episodes don't leak hostname mappings. Pick a hostname
+    # under a reserved test TLD (`.example`, `.test`, `.localhost`)
+    # so it can't collide with a real DNS name. None ⇒ use 127.0.0.1.
+    hostname: Optional[str] = None
 
 
 # ─────────────────────────────── Messages ────────────────────────────

@@ -45,7 +45,10 @@ import sys
 from typing import Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "benchmark"))
 from sibb_xcuitest_client import XCUITestReader  # noqa: E402
+from sibb_state import _safari_clear_tab_state  # noqa: E402
 
 SAFARI_BUNDLE = "com.apple.mobilesafari"
 
@@ -292,33 +295,69 @@ async def snap(reader: XCUITestReader) -> Tuple[List[Dict], Set[str]]:
     return elements, subs
 
 
-async def scroll_down_in_webview(reader: XCUITestReader,
-                                   y_top_avoid: float) -> None:
-    """Swipe up (= scroll down in content) at mid-x, bounded below the
-    URL bar so we don't hit chrome."""
-    x = W // 2
-    y1 = int(H * 0.85)
-    y2 = max(int(H * 0.18), int(y_top_avoid + 20))
-    # Use a fling-style velocity for a meaningful scroll distance.
-    await reader.swipe_at(float(x), float(y1),
-                           float(x), float(y2),
+async def scroll_in_scrollable(reader: XCUITestReader,
+                                elements: List[Dict],
+                                direction: str) -> bool:
+    """Find the largest scrollable element and pan it.
+
+    `direction` = "down" / "up" (content direction). Inverts to finger
+    direction internally (down = finger UP). Returns True if a
+    scrollable region was found and a swipe issued; False if none
+    found. 80% amplitude swipe bounded within the element frame.
+    """
+    bounds = _find_scrollable_frame(elements)
+    if bounds is None:
+        return False
+    x0, y0, x1, y1 = bounds
+    cx = (x0 + x1) / 2.0
+    h = y1 - y0
+    if direction == "down":
+        y_start, y_end = y0 + h * 0.85, y0 + h * 0.15
+    elif direction == "up":
+        y_start, y_end = y0 + h * 0.15, y0 + h * 0.85
+    else:
+        return False
+    await reader.swipe_at(cx, y_start, cx, y_end,
                            duration_s=0.05,
                            velocity_pps=1500.0)
     await asyncio.sleep(GESTURE_SETTLE_S)
+    return True
 
 
-async def scroll_up_in_webview(reader: XCUITestReader,
-                                 y_top_avoid: float) -> None:
-    """Inverse of scroll_down — reveals earlier content. Used by the
-    retention test."""
-    x = W // 2
-    y1 = max(int(H * 0.20), int(y_top_avoid + 20))
-    y2 = int(H * 0.85)
-    await reader.swipe_at(float(x), float(y1),
-                           float(x), float(y2),
-                           duration_s=0.05,
-                           velocity_pps=1500.0)
-    await asyncio.sleep(GESTURE_SETTLE_S)
+def _find_scrollable_frame(
+        elements: List[Dict]) -> Optional[Tuple[float, float, float, float]]:
+    """Find the largest scrollable element's frame. Returns
+    (x, y, x+width, y+height) or None.
+
+    iOS Safari exposes the WKWebView under role `web`. Other apps use
+    `scroll`, `table`, or `collection`. The same selection logic works
+    for all of them — pick the largest by area. This is the per-app
+    independence the 2026-06-03 refactor of SCROLL is built on: we
+    SCROLL inside the largest scrollable region rather than guessing
+    coordinates that happen to work for one Safari chrome layout.
+    """
+    candidates: List[Tuple[float, Tuple[float, float, float, float]]] = []
+    for e in elements:
+        role = (e.get("role") or "").lower()
+        if role not in ("web", "scroll", "table", "collection"):
+            continue
+        fr = e.get("frame") or {}
+        x = fr.get("x")
+        y = fr.get("y")
+        w = fr.get("width")
+        h = fr.get("height")
+        if x is None or y is None or w is None or h is None:
+            continue
+        area = float(w) * float(h)
+        if area <= 0:
+            continue
+        candidates.append(
+            (area, (float(x), float(y),
+                    float(x) + float(w), float(y) + float(h))))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: -t[0])  # largest first
+    return candidates[0][1]
 
 
 async def run_one_url(reader: XCUITestReader,
@@ -328,11 +367,21 @@ async def run_one_url(reader: XCUITestReader,
     print(f"  {url}")
     print(f"══════════════════════════════════════════════════════════════")
 
-    # Cold-open Safari at the URL.
+    # Cold-open Safari at the URL with a clean tab state.
+    #
+    # 2026-06-03 finding: leftover tabs from a prior probe run made
+    # the next run's `simctl openurl` land in Safari's TAB SWITCHER
+    # view (visible by tile buttons "<page-title> - Wikipedia" and
+    # "Private, Tab Group" chrome). Our scroll gestures then panned
+    # the tab carousel, not the article — every snapshot returned
+    # IDENTICAL element counts. Wiping SafariTabs.db + BrowserState.db
+    # forces a fresh Start Page so openurl lands in a single-tab view.
     subprocess.run(
         ["xcrun", "simctl", "terminate", UDID, SAFARI_BUNDLE],
         capture_output=True, timeout=5)
     await asyncio.sleep(0.6)
+    _safari_clear_tab_state(UDID)
+    await asyncio.sleep(0.3)
     subprocess.run(
         ["xcrun", "simctl", "openurl", UDID, url],
         capture_output=True, timeout=5)
@@ -409,9 +458,14 @@ async def run_one_url(reader: XCUITestReader,
             print(fmt_sample(sorted(new)))
 
         if step < 4:
-            url_bar_y = find_url_bar_y(elements) or (H * 0.10)
             try:
-                await scroll_down_in_webview(reader, url_bar_y)
+                ok = await scroll_in_scrollable(reader, elements, "down")
+                if not ok:
+                    print(f"  scroll #{step+1} FAILED: no scrollable element "
+                          "found in AX tree (no role:web/scroll/table/"
+                          "collection with non-zero frame)")
+                    truncated_walk = True
+                    break
             except Exception as e:
                 print(f"  scroll #{step+1} FAILED: {e!r}")
                 truncated_walk = True
@@ -429,10 +483,15 @@ async def run_one_url(reader: XCUITestReader,
         print(f"\n── RETENTION PROBE (scroll back up to baseline) ──────────")
         try:
             elements_pre, _ = await snap(reader)
-            url_bar_y = find_url_bar_y(elements_pre) or (H * 0.10)
             # Scroll up the same number of times we scrolled down.
             for i in range(4):
-                await scroll_up_in_webview(reader, url_bar_y)
+                ok = await scroll_in_scrollable(reader, elements_pre, "up")
+                if not ok:
+                    break
+                # Snapshot for the next scroll so we re-find the
+                # scrollable element (its frame may shift as the URL bar
+                # collapses/expands).
+                elements_pre, _ = await snap(reader)
             elements_after, subs_after = await snap(reader)
         except Exception as e:
             print(f"  retention probe FAILED: {e!r}")
@@ -559,9 +618,12 @@ async def run_one_url(reader: XCUITestReader,
             print(fmt_sample(sorted(new)))
 
         if step < 3:
-            url_bar_y = find_url_bar_y(elements) or (H * 0.10)
             try:
-                await scroll_down_in_webview(reader, url_bar_y)
+                ok = await scroll_in_scrollable(reader, elements, "down")
+                if not ok:
+                    print(f"  scroll #{step+1} FAILED: no scrollable element "
+                          "in Reader Mode AX tree")
+                    break
             except Exception as e:
                 print(f"  scroll #{step+1} FAILED: {e!r}")
                 break

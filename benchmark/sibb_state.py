@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import time
 import uuid
-from typing import Any, ClassVar, Dict, List, Optional, Protocol
+from typing import Any, ClassVar, Dict, List, Optional, Protocol, Set, Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1117,19 +1118,80 @@ def _safari_bookmarks_bar_parent_id(conn) -> Optional[int]:
 
 def _safari_reading_list_parent_id(conn) -> Optional[int]:
     """The Reading List folder ID. Reading List entries live in the
-    same `bookmarks` table under a separate special-id parent
-    (typically special_id=4 on iOS). Returns None if the row isn't
-    present yet (e.g. fresh sim that never opened Reading List)."""
+    same `bookmarks` table under a separate special-id parent. iOS
+    26.3 uses `special_id=3` (empirically verified 2026-06-05 against
+    a real sim); older iOS versions may differ. Returns None if the
+    row isn't present yet (e.g. fresh sim that never opened Reading
+    List)."""
     row = conn.execute(
-        "SELECT id FROM bookmarks WHERE special_id=4 LIMIT 1;"
+        "SELECT id FROM bookmarks WHERE special_id=3 LIMIT 1;"
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _safari_clear_user_bookmarks(udid: str) -> None:
+    """Wipe every user bookmark + user-created subfolder from
+    Bookmarks.db, preserving the structural special-id folders (Root,
+    BookmarksBar/Favorites, Reading List). Called from
+    SafariHandler.reset() so spec apply starts from a clean slate.
+
+    Safari may still hold the DB open; caller is responsible for
+    terminating Safari first (the existing reset() path does this via
+    `_safari_terminate`). Silently no-ops if the DB doesn't exist yet
+    (Safari hasn't been launched).
+    """
+    db_path = _safari_bookmarks_db_path(udid)
+    if not os.path.exists(db_path):
+        return
+    conn = _sqlite3.connect(db_path, isolation_level=None)
+    try:
+        # Delete user data while preserving the structural rows the
+        # apply path depends on:
+        #   * the Root row (parent IS NULL) — needed as the BFS anchor
+        #   * BookmarksBar (special_id=1) — apply targets this folder
+        #   * Reading List (special_id=3 on iOS 26) — separate tree
+        #
+        # Everything else — user leaf bookmarks (`type=0`) and user-
+        # created subfolders (`type=1` with no special_id) — gets
+        # wiped. iOS's Root row also has special_id=0, so we can't
+        # filter purely by special_id; the `parent IS NOT NULL` guard
+        # is what keeps Root alive.
+        conn.execute(
+            "DELETE FROM bookmarks "
+            "WHERE parent IS NOT NULL "
+            "AND special_id NOT IN (1, 3);"
+        )
+    finally:
+        conn.close()
+
+
+def _safari_bookmarks_root_id(conn) -> Optional[int]:
+    """The top "Bookmarks" tree root — what iOS Safari shows in the
+    Bookmarks tab. This is the row with `parent IS NULL` (titled
+    "Root" in the DB schema). Direct children include:
+      * the "Bookmarks Bar" / Favorites folder (special_id=1)
+      * the Reading List folder (special_id=3 on iOS 26)
+      * any user-saved leaf bookmark at the top level — this is
+        where iOS' "Add to Bookmarks" share-sheet action defaults
+        on iOS 26 (verified 2026-06-05).
+    Returns None if the schema doesn't have a NULL-parent row
+    (defensive — should always exist after Safari's first launch).
+    """
+    row = conn.execute(
+        "SELECT id FROM bookmarks WHERE parent IS NULL LIMIT 1;"
     ).fetchone()
     return row[0] if row else None
 
 
 def _safari_bookmark_path(conn, row_id: int) -> List[str]:
-    """Walk up from a bookmark row to the root, returning the folder
-    titles encountered. Used to surface `folder_path` so verifiers can
-    distinguish "in Favorites" vs "in Favorites > Recipes" vs root."""
+    """Walk up from a bookmark row to the user-facing tree root,
+    returning the folder titles encountered. Stops at the user-facing
+    boundary (BookmarksBar=Favorites, Reading List) and labels that
+    boundary the way iOS Safari labels it in the UI.
+
+    Used to surface `folder_path` so verifiers can distinguish "in
+    Favorites" vs "in Favorites > Recipes" vs Reading List.
+    """
     path: List[str] = []
     cur = row_id
     seen: Set[int] = set()
@@ -1141,12 +1203,21 @@ def _safari_bookmark_path(conn, row_id: int) -> List[str]:
         if row is None:
             break
         parent, title, special_id = row
-        # Root folder has parent=NULL; stop there. Don't include the
-        # bookmark's own title — just folder ancestry.
+        # Don't include the bookmark's own title — just folder ancestry.
         if cur != row_id:
-            label = title or (f"<special:{special_id}>" if special_id else "")
-            if label:
-                path.append(label)
+            if special_id == 1:
+                path.append("Favorites")
+                # Stop at the user-facing tree boundary.
+                break
+            if special_id == 3:
+                path.append("Reading List")
+                break
+            if title:
+                path.append(title)
+            elif parent is None:
+                # The DB root (parent IS NULL) — UI calls it "Bookmarks".
+                path.append("Bookmarks")
+                break
         if parent is None:
             break
         cur = parent
@@ -1235,58 +1306,87 @@ async def _safari_list_bookmarks(
 ) -> List[Dict[str, Any]]:
     """Read leaf bookmarks (type=0) from Safari's Bookmarks.db.
 
-    By default returns every leaf bookmark anywhere under the
-    BookmarksBar (= "Favorites" in UI), recursively walking subfolders.
-    The 2026-06-01 fix replaced the prior parent=BookmarksBar-only
-    query — bookmarks the user creates in a subfolder were previously
-    invisible, which silently broke any mutation generator where iOS's
-    "Add Bookmark" UI defaulted to a folder other than the BookmarksBar
-    root.
+    Walks the **whole user-visible Bookmarks tab tree** from the DB
+    root (`parent IS NULL`), recursively. That captures three classes
+    of bookmarks:
+      * Leaves directly at the top "Bookmarks" tab level — iOS 26
+        Safari's "Add to Bookmarks" share-sheet action defaults to
+        here (verified 2026-06-05 against a real sim).
+      * Leaves anywhere under "Favorites" / BookmarksBar (special_id=1)
+        including nested subfolders.
+      * Leaves under user-created subfolders at any level.
+
+    Reading List (special_id=3 on iOS 26) is excluded unless
+    `include_reading_list=True` is set. Reading List entries surface
+    with `kind="reading_list"`; everything else with `kind="bookmark"`.
 
     Args:
-      parent_filter: if set, restrict results to bookmarks DIRECTLY
-        under a folder with this title (case-insensitive). E.g.
-        "Favorites" restricts to BookmarksBar root only.
-      include_subfolders: if True (default), recursively include
-        bookmarks in subfolders of the BookmarksBar tree.
+      parent_filter: if set, restrict results to bookmarks whose
+        ancestry path contains a folder with this title (case-
+        insensitive). E.g. "Favorites" restricts to the Favorites
+        subtree, "Recipes" matches any Recipes folder anywhere in the
+        tree.
+      include_subfolders: if True (default), recursively descend into
+        subfolders. If False, only leaves directly under the Bookmarks
+        tab root + directly under Favorites are returned.
       include_reading_list: if True, also include Reading List entries
-        (special_id=4 parent). Reading List rows are tagged with
-        `kind="reading_list"`; regular bookmarks with `kind="bookmark"`.
+        (special_id=3 parent).
 
     Returns rows with: id, title, url, parent_id, parent_title,
     folder_path (list of folder titles from root → leaf, excluding the
-    bookmark's own title), kind."""
+    bookmark's own title), kind.
+
+    Pre-2026-06-05 the walk started from BookmarksBar only and missed
+    everything iOS' default Add-Bookmark action saved at the root level.
+    Empirical fix: walk the actual tree root.
+    """
     db_path = _safari_bookmarks_db_path(udid)
     if not os.path.exists(db_path):
         return []
     conn = _sqlite3.connect(db_path, isolation_level=None)
     try:
-        bookmarks_bar = _safari_bookmarks_bar_parent_id(conn)
-        if bookmarks_bar is None:
+        root = _safari_bookmarks_root_id(conn)
+        if root is None:
+            # Defensive: schema should always have a NULL-parent row.
             return []
+        rl_root = _safari_reading_list_parent_id(conn)
 
-        # Collect all folder IDs under the BookmarksBar tree.
+        # Collect all folder IDs in the tree from the root, optionally
+        # descending into subfolders. ALWAYS exclude the Reading List
+        # subtree unless `include_reading_list` is set — its leaves
+        # would otherwise be mis-tagged as bookmarks.
+        tree_ids = {root}
         if include_subfolders:
-            tree_ids = {bookmarks_bar}
-            frontier = [bookmarks_bar]
+            frontier = [root]
             while frontier:
                 children = conn.execute(
                     "SELECT id FROM bookmarks "
                     "WHERE parent=? AND type=1 AND deleted=0;",
                     (frontier.pop(),)).fetchall()
                 for (cid,) in children:
-                    if cid not in tree_ids:
-                        tree_ids.add(cid)
-                        frontier.append(cid)
+                    if cid in tree_ids:
+                        continue
+                    if not include_reading_list and cid == rl_root:
+                        continue
+                    tree_ids.add(cid)
+                    frontier.append(cid)
         else:
-            tree_ids = {bookmarks_bar}
+            # Just root + its immediate top-level subfolder children
+            # (Favorites, etc. — but NOT Reading List unless opted in).
+            children = conn.execute(
+                "SELECT id FROM bookmarks "
+                "WHERE parent=? AND type=1 AND deleted=0;",
+                (root,)).fetchall()
+            for (cid,) in children:
+                if not include_reading_list and cid == rl_root:
+                    continue
+                tree_ids.add(cid)
 
-        # Optionally pull in Reading List as a parallel tree.
-        rl_root = (_safari_reading_list_parent_id(conn)
-                    if include_reading_list else None)
-        rl_ids: Set[int] = set()
-        if rl_root is not None:
-            rl_ids.add(rl_root)
+        # Compute the set of folder IDs whose subtree is the Reading
+        # List (so leaves under them can be tagged kind="reading_list").
+        rl_subtree: Set[int] = set()
+        if rl_root is not None and rl_root in tree_ids:
+            rl_subtree.add(rl_root)
             frontier = [rl_root]
             while frontier:
                 children = conn.execute(
@@ -1294,25 +1394,24 @@ async def _safari_list_bookmarks(
                     "WHERE parent=? AND type=1 AND deleted=0;",
                     (frontier.pop(),)).fetchall()
                 for (cid,) in children:
-                    if cid not in rl_ids:
-                        rl_ids.add(cid)
-                        frontier.append(cid)
+                    if cid in rl_subtree:
+                        continue
+                    rl_subtree.add(cid)
+                    frontier.append(cid)
 
-        # Pull leaves under any of the collected folders.
-        all_ids = tree_ids | rl_ids
-        if not all_ids:
+        if not tree_ids:
             return []
-        placeholders = ",".join("?" * len(all_ids))
+        placeholders = ",".join("?" * len(tree_ids))
         rows = conn.execute(
             f"SELECT id, title, url, parent FROM bookmarks "
             f"WHERE parent IN ({placeholders}) "
             f"AND type=0 AND deleted=0 "
             f"ORDER BY parent, order_index;",
-            tuple(all_ids)).fetchall()
+            tuple(tree_ids)).fetchall()
 
         # Build a parent_id → title cache for folder_path resolution.
         parent_titles: Dict[int, str] = {}
-        for pid in all_ids:
+        for pid in tree_ids:
             t = conn.execute(
                 "SELECT title, special_id FROM bookmarks WHERE id=?;",
                 (pid,)).fetchone()
@@ -1323,8 +1422,10 @@ async def _safari_list_bookmarks(
                 parent_titles[pid] = title
             elif special_id == 1:
                 parent_titles[pid] = "Favorites"
-            elif special_id == 4:
+            elif special_id == 3:
                 parent_titles[pid] = "Reading List"
+            elif pid == root:
+                parent_titles[pid] = "Bookmarks"
             else:
                 parent_titles[pid] = f"<special:{special_id}>" if special_id else ""
 
@@ -1332,7 +1433,7 @@ async def _safari_list_bookmarks(
         pfilter_norm = (parent_filter or "").strip().lower()
         for r in rows:
             row_id, title, url, parent_id = r
-            kind = "reading_list" if parent_id in rl_ids else "bookmark"
+            kind = "reading_list" if parent_id in rl_subtree else "bookmark"
             parent_title = parent_titles.get(parent_id, "")
             path = _safari_bookmark_path(conn, row_id)
             if pfilter_norm:
@@ -1383,15 +1484,20 @@ class SafariHandler:
         self._mock_sites: List[Any] = []
 
     async def reset(self) -> None:
-        # No mock-site spawns → keep v1's "don't touch bookmarks"
-        # contract intact. With sites present, terminate Safari
-        # first so keep-alive sockets close cleanly before we shut
-        # the HTTP fixtures down.
-        if not self._mock_sites:
-            return
+        # 2026-06-05: wipe ALL user bookmarks before spec apply, so
+        # iOS-preinstalled bookmarks (e.g. "iPhone User Guide" at the
+        # root level on a fresh sim) AND leftover state from previous
+        # episodes don't pollute the verifier's count assertion. The
+        # structural folders are preserved — only `type=0` (leaf
+        # bookmarks) and `type=1` user-created subfolders are deleted;
+        # the special-id rows (Root, BookmarksBar/Favorites, Reading
+        # List) stay so the schema invariants the apply path depends
+        # on remain intact.
         udid = getattr(self.reader, "udid", None)
         if udid:
             await _safari_terminate(udid)
+            _safari_clear_user_bookmarks(udid)
+        # Mock sites teardown — unchanged from v1.
         while self._mock_sites:
             site = self._mock_sites.pop()
             try:
@@ -1401,6 +1507,9 @@ class SafariHandler:
                 # failing teardown doesn't poison subsequent
                 # handler resets.
                 pass
+        # Hostname routing teardown is unnecessary — the host-side DNS
+        # resolver is a process-shared daemon thread (no per-episode
+        # state to clear).
 
     async def apply(self, entry: Dict[str, Any]) -> None:
         kind = entry.get("type")
@@ -1454,11 +1563,77 @@ class SafariHandler:
             if entry.get(opt) is not None:
                 site_kwargs[opt] = entry[opt]
 
+        # Phase 4 harness: resolve static-page template names (the spec
+        # is JSON/dataclass-friendly so it carries NAMES; the runtime
+        # callables live in `harness_layout.PAGE_REGISTRY`).
+        spec_static = entry.get("static_pages") or {}
+        if spec_static:
+            # Force-import the page-template module so its
+            # `@register_page("...")` decorators run BEFORE we look
+            # up names. Generators that ship their own templates
+            # alongside the generator file should also be imported
+            # here; for now there's one canonical module.
+            import harness_pages  # noqa: F401 — side-effect import
+            from harness_layout import PAGE_REGISTRY
+            resolved: Dict[str, Any] = {}
+            for path, tpl_name in spec_static.items():
+                if not isinstance(path, str) or not isinstance(tpl_name, str):
+                    raise ValueError(
+                        "SafariHandler.mock_site.static_pages: keys + "
+                        "values must be str (URL path → template name)")
+                fn = PAGE_REGISTRY.get(tpl_name)
+                if fn is None:
+                    raise ValueError(
+                        f"SafariHandler.mock_site.static_pages: no "
+                        f"harness page registered as {tpl_name!r} "
+                        f"(known: {sorted(PAGE_REGISTRY)})")
+                resolved[path] = fn
+            site_kwargs["static_pages"] = resolved
+
         site = MockSite(**site_kwargs)
+        # Per-episode page seed (Phase 4 harness). Defaults to 0 in the
+        # MockSite constructor; the spec can override for replayable
+        # cross-episode variance.
+        page_seed = entry.get("page_seed")
+        if page_seed is not None:
+            site.page_seed = int(page_seed)
         site.start()
         # Track before navigating so an open_in_safari failure still
         # leaves the fixture visible to reset() for cleanup.
         self._mock_sites.append(site)
+
+        # Optional friendly hostname. We resolve `*.test` to 127.0.0.1
+        # via a host-side DNS server (see sibb_dns_resolver) bound to
+        # 127.0.0.1:35353 and a one-time `/etc/resolver/test` install.
+        # macOS' resolver — and the iOS sim Safari, which inherits it
+        # — route every `.test` lookup to that server. If the resolver
+        # isn't installed, we silently fall back to the numeric URL so
+        # episodes still pass (just less realistic in the prompt).
+        hostname = entry.get("hostname")
+        hostname_resolvable = False
+        if hostname:
+            if not isinstance(hostname, str) or not hostname.strip():
+                raise ValueError(
+                    "SafariHandler.mock_site.hostname must be a "
+                    "non-empty string")
+            hostname = hostname.strip()
+            import sibb_dns_resolver
+            # Lazy-spawn the DNS server (process-shared singleton).
+            sibb_dns_resolver.start_if_needed()
+            # We only USE the friendly hostname if the host's resolver
+            # is actually configured to route .test through us.
+            # Otherwise Safari would fall through to the public DNS
+            # path and end up on a search-results page.
+            if sibb_dns_resolver.resolver_is_installed():
+                hostname_resolvable = True
+            else:
+                print(
+                    "[sibb_state] /etc/resolver/test not installed; "
+                    "falling back to 127.0.0.1 URL. Run "
+                    "`python scripts/sibb_install_dns_resolver.py` "
+                    "to enable friendly hostnames.",
+                    file=sys.stderr,
+                )
 
         if entry.get("open_at_start", True):
             udid = getattr(self.reader, "udid", None)
@@ -1471,7 +1646,23 @@ class SafariHandler:
             # the login form on first observation.
             await _safari_terminate(udid)
             await asyncio.sleep(0.5)
-            open_in_safari(udid, site.login_url)
+            # `start_path` lets harness-page generators land Safari
+            # on a non-login route (e.g. /event for an RSVP form).
+            # Defaults to login_url for legacy MockSite tasks.
+            start_path = entry.get("start_path")
+            if hostname_resolvable and site.port is not None:
+                # Use the friendly hostname only when DNS is configured
+                # to route it to our loopback HTTP server.
+                host_url = f"http://{hostname}:{site.port}"
+            else:
+                host_url = site.base_url
+            if start_path:
+                start_url = host_url + start_path
+            else:
+                start_url = (host_url + site.sign_in_path
+                              if hostname_resolvable
+                              else site.login_url)
+            open_in_safari(udid, start_url)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2758,7 +2949,69 @@ async def apply_initial_state(reader, task) -> Dict[str, Any]:
                 report["errors"].append(
                     f"{bid}.apply({entry.get('type')}) failed: {e}")
 
+    # Step 5i (2026-06-07) — resolve `{port:<site_id>}` placeholders in
+    # task.instruction + task.params now that handlers have spawned
+    # their MockSites (so the OS-assigned port is known). The generator
+    # cannot know the port upfront — and a fixed port would recreate
+    # the same parallel-bind-race problem we have on UDP/35353 for DNS.
+    # The placeholder is `{port:rsvp-abcd1234}` etc.; the substring
+    # `port:<site_id>` uniquely identifies one bound MockSite. Mutates
+    # `task` in place (callers re-read task.instruction after this).
+    _resolve_port_placeholders(task, spec, report)
+
     return report
+
+
+_PORT_PLACEHOLDER_RE = re.compile(r"\{port:([^{}]+)\}")
+
+
+def _resolve_port_placeholders(task, spec, report) -> None:
+    """In-place: replace `{port:<site_id>}` tokens in task.instruction
+    and string params with the matching MockSite's bound port. Records
+    a `port_resolutions` entry on `report` so the JSONL captures what
+    happened. Any placeholder that remains after the pass — either
+    because the spec doesn't reference it, or because the named site
+    failed to bind — is reported as an error so the runner can fail
+    loudly rather than ship the agent a literal `{port:...}` URL.
+    """
+    from sibb_mock_site import get_site
+    resolutions: List[Dict[str, Any]] = []
+    for entry in spec:
+        if entry.get("type") != "mock_site":
+            continue
+        sid = entry.get("site_id")
+        if not sid:
+            continue
+        site = get_site(sid)
+        if site is None or site.port is None:
+            # The unresolved scan below will catch this if the
+            # placeholder is actually in the instruction/params.
+            continue
+        token = "{port:" + sid + "}"
+        old_instruction = getattr(task, "instruction", "")
+        new_instruction = old_instruction.replace(token, str(site.port))
+        if new_instruction != old_instruction:
+            task.instruction = new_instruction
+        params = getattr(task, "params", None) or {}
+        for k, v in list(params.items()):
+            if isinstance(v, str) and token in v:
+                params[k] = v.replace(token, str(site.port))
+        resolutions.append({"site_id": sid, "port": site.port,
+                             "token": token})
+    if resolutions:
+        report["port_resolutions"] = resolutions
+    # Detect any leftover `{port:...}` tokens after substitution. The
+    # agent would otherwise navigate to a literal placeholder string.
+    leftover_sites: set = set()
+    for text in [getattr(task, "instruction", "") or ""] + [
+            v for v in (getattr(task, "params", None) or {}).values()
+            if isinstance(v, str)]:
+        for m in _PORT_PLACEHOLDER_RE.finditer(text):
+            leftover_sites.add(m.group(1))
+    for sid in sorted(leftover_sites):
+        report["errors"].append(
+            f"port-placeholder unresolved for site_id={sid!r}: no "
+            f"bound MockSite (placeholder remains literal in task)")
 
 
 if __name__ == "__main__":

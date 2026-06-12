@@ -164,11 +164,53 @@ class FakeXCUITestReader:
             return self._swipe_at(cmd)
         if t == "swipe":
             return {"ok": True, "direction": cmd.get("direction", "up")}
+        if t == "pinch":
+            return {"ok": True,
+                     "scale": cmd.get("scale", 0.5),
+                     "velocity": cmd.get("velocity", 1.0)}
         if t == "observe":
             return self._observe(cmd)
         if t == "tap":
+            # Instrumented for tests asserting "didn't accidentally
+            # route to single-tap" (notably DOUBLE_TAP regressions).
+            # Same pattern as `tap_then_type_call_count` and
+            # `double_tap_call_count` below.
+            if not hasattr(self, "tap_call_count"):
+                self.tap_call_count = 0
+            self.tap_call_count += 1
+            if not hasattr(self, "tap_calls"):
+                self.tap_calls = []
+            self.tap_calls.append(
+                {"x": cmd.get("x"), "y": cmd.get("y"),
+                 "ref": cmd.get("ref")})
+            return {"ok": True}
+        if t == "double_tap":
+            # Instrumented for tests asserting the executor reached
+            # Swift. Mirrors `tap_then_type_call_count` pattern.
+            if not hasattr(self, "double_tap_call_count"):
+                self.double_tap_call_count = 0
+            self.double_tap_call_count += 1
+            if not hasattr(self, "double_tap_calls"):
+                self.double_tap_calls = []
+            self.double_tap_calls.append(
+                {"x": cmd.get("x"), "y": cmd.get("y"),
+                 "ref": cmd.get("ref")})
             return {"ok": True}
         if t == "type":
+            return {"ok": True}
+        if t == "return":
+            # Instrumented so RETURN-verb L1 tests can assert the
+            # executor reached Swift (same pattern as double_tap +
+            # tap_then_type counters above). Step 5L-C also lets the
+            # test simulate Swift's no-keyboard error path by setting
+            # `return_simulate_no_keyboard = True` on the fake.
+            if not hasattr(self, "return_call_count"):
+                self.return_call_count = 0
+            self.return_call_count += 1
+            if getattr(self, "return_simulate_no_keyboard", False):
+                return {"ok": False, "error": "no_keyboard",
+                         "hint": ("No soft keyboard is up — RETURN "
+                                  "requires a focused text input.")}
             return {"ok": True}
         if t == "clear_text":
             return self._clear_text(cmd)
@@ -193,7 +235,7 @@ class FakeXCUITestReader:
         if not resp.get("ok"):
             raise RuntimeError(f"observe failed: {resp.get('error')}")
         elements = [AXElement(e) for e in resp.get("elements", [])]
-        return AXTree(
+        tree = AXTree(
             elements,
             self.udid,
             keyboard_visible=resp.get("keyboard_visible", False),
@@ -203,6 +245,10 @@ class FakeXCUITestReader:
             bundle_id=resp.get("bundle_id", ""),
             keyboard_frame=resp.get("keyboard_frame"),
         )
+        # Mirror the live client: gracefully pass-through new fields.
+        tree.zoom_scale = resp.get("zoom_scale")
+        tree.accessory_bar_frame = resp.get("accessory_bar_frame")
+        return tree
 
     async def type_text(self, text: str) -> None:
         """Mirror of XCUITestReader.type_text (raw typeText to
@@ -222,6 +268,33 @@ class FakeXCUITestReader:
         if y is not None: cmd["y"] = y
         if ref: cmd["ref"] = ref
         await self._send(cmd)
+
+    async def double_tap(self, x: float = None, y: float = None,
+                          ref: str = None) -> None:
+        """Mirror of XCUITestReader.double_tap. The dispatched command
+        increments `double_tap_call_count` and appends to
+        `double_tap_calls` so tests can assert what coords/refs were
+        sent."""
+        cmd: Dict[str, Any] = {"type": "double_tap"}
+        if x is not None: cmd["x"] = x
+        if y is not None: cmd["y"] = y
+        if ref: cmd["ref"] = ref
+        await self._send(cmd)
+
+    async def pinch(self, scale: float = 0.5,
+                     velocity: float = 1.0) -> Dict[str, Any]:
+        """Mirror of XCUITestReader.pinch — records the call in
+        `self.pinch_history` for tests, returns the canonical OK
+        envelope."""
+        if not hasattr(self, "pinch_history"):
+            self.pinch_history: List[Dict[str, float]] = []
+        self.pinch_history.append({"scale": float(scale),
+                                     "velocity": float(velocity)})
+        return await self._send({
+            "type": "pinch",
+            "scale": float(scale),
+            "velocity": float(velocity),
+        })
 
     async def tap_then_type(self, x: float, y: float, text: str,
                               focus_timeout_ms: int = 1500
@@ -251,10 +324,23 @@ class FakeXCUITestReader:
                               bundle_id: str = "fake.bundle",
                               keyboard_visible: bool = False,
                               screen_width: int = 402,
-                              screen_height: int = 874) -> None:
+                              screen_height: int = 874,
+                              keyboard_frame: Optional[Dict[str, float]] = None,
+                              zoom_scale: Optional[float] = None,
+                              accessory_bar_frame: Optional[Dict[str, float]] = None,
+                              ) -> None:
         """Set the canned response for the next `observe` call. Tests
         construct synthetic AX trees here to exercise the scaffold's
-        observation pipeline without a real simulator."""
+        observation pipeline without a real simulator.
+
+        New optional kwargs (added 2026-06-05) for the Safari auto-zoom
+        robustness work:
+          * keyboard_frame — {x, y, width, height} for the on-screen kb
+          * zoom_scale     — WKWebView zoom factor (1.0 = unzoomed)
+          * accessory_bar_frame — predictive bar / inputAccessoryView
+        These are passed through to scaffold._read_xcuitest as a real
+        Swift response would.
+        """
         self._observe_resp = {
             "ok": True,
             "elements": elements,
@@ -264,6 +350,12 @@ class FakeXCUITestReader:
             "screen_height": screen_height,
             "method": "snapshot",
         }
+        if keyboard_frame is not None:
+            self._observe_resp["keyboard_frame"] = keyboard_frame
+        if zoom_scale is not None:
+            self._observe_resp["zoom_scale"] = zoom_scale
+        if accessory_bar_frame is not None:
+            self._observe_resp["accessory_bar_frame"] = accessory_bar_frame
 
     def _observe(self, _cmd: Dict[str, Any]) -> Dict[str, Any]:
         resp = getattr(self, "_observe_resp", None)
@@ -277,7 +369,18 @@ class FakeXCUITestReader:
     def _tap_then_type(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
         """Stub for the Swift `tap_then_type` command. Tests configure
         the response via set_tap_then_type_response(); default is
-        success with focus acquired in 100ms."""
+        success with focus acquired in 100ms.
+
+        Instrumented for tests: increments `tap_then_type_call_count`
+        on every call. Tests using `set_tap_then_type_response(
+        error="should not be called")` should also assert
+        `fake.tap_then_type_call_count == 0` to actually pin the
+        short-circuit. Without that, the "should not be called" error
+        merely propagates through the result dict and a regression
+        that DID call Swift would still pass."""
+        if not hasattr(self, "tap_then_type_call_count"):
+            self.tap_then_type_call_count = 0
+        self.tap_then_type_call_count += 1
         x = cmd.get("x"); y = cmd.get("y")
         text = cmd.get("text")
         if (not isinstance(x, (int, float)) or

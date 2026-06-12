@@ -68,6 +68,39 @@ Layered run instructions live in
 
 ---
 
+## Part 0.5: DNS resolver for harness-served pages (one-time, optional)
+
+The Phase-4 Safari harness lets a task spawn a local MockSite that the
+agent visits via a friendly hostname (`http://aurora-conference.test/event`)
+rather than `http://127.0.0.1:54321/event`. To make the iOS simulator
+Safari resolve `*.test` to localhost, install a per-suffix macOS
+resolver entry that points at the SIBB DNS server (port 35353):
+
+```bash
+python3 scripts/sibb_install_dns_resolver.py
+```
+
+This:
+* Prompts once for sudo and writes `/etc/resolver/test` with two lines
+  (`nameserver 127.0.0.1` / `port 35353`).
+* Is idempotent (re-running does nothing if the file is correct).
+* Only affects the `.test` TLD (RFC 6761 reserved — cannot collide
+  with a real public domain).
+* Is cleanly undone with `sudo rm /etc/resolver/test`.
+
+The DNS server itself is a daemon thread inside the Python test
+runner — it spawns lazily on the first MockSite of the run and dies
+when the process exits (no PID files, no launchd). Multiple parallel
+runners on the same host: first one binds 35353, others fall back to
+`127.0.0.1` URLs automatically.
+
+**Skipping this step is safe.** Harness tasks still work without the
+resolver — they fall back to `http://127.0.0.1:<port>/...` URLs in
+the agent prompt and print a one-line warning. The agent's task
+success is unaffected; only the realism of the URL string is.
+
+---
+
 ## Part 1: New iOS Runtime Setup
 
 ### When to run
