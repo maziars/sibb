@@ -73,7 +73,7 @@ async def test_multi_app_task_setup_then_agent_completes(
         clean, task.verify_checks)
     assert sibb_verify.blocking_pass(results_before) is False, (
         "verifier-BEFORE unexpectedly passed: task is pre-completed "
-        "(footgun PHASE2_PROGRESS.md flags) — re-roll the seed."
+        "re-roll the seed."
     )
 
     # Simulate the agent: create the calendar event via the handler.

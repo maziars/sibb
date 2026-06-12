@@ -220,7 +220,7 @@ async def run_episode_scripted(
             # boot even after simctl privacy grant has updated TCC.db.
             # Placed here (last step before reader.start) so prewarm's
             # app launches aren't disrupted by a mid-flight SpringBoard
-            # restart. See TODO_DEFERRED.md B3.
+            # restart..
             if own_sim:
                 await restart_springboard(udid)
 

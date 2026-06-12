@@ -1,21 +1,38 @@
 # SIBB
 
-**Smartphone Interaction Benchmark for Bots** — a reproducible iOS benchmark for
-evaluating AI agents on real iPhone-simulator tasks.
+**Smartphone Interaction Benchmark for Bots** — a reproducible iOS benchmark
+for LLM agents, with **database-level ground truth** and **three matched
+baselines** (UI, API, hybrid).
 
-SIBB exercises language-model-driven agents on multi-step tasks across the
-system apps that ship with iOS, using Apple's own XCUITest framework as the
-action substrate and database/file-level ground truth for verification. Tasks
-are procedurally generated with seedable distractor noise, so the corpus
-remains a moving target after release.
+SIBB runs LLM agents on multi-step tasks across iOS's built-in apps. Actions
+go through Apple's XCUITest framework; verification reads ground truth from
+the underlying data stores — EventKit, sqlite, PhotoKit, Maps' rstorage,
+Contacts.framework — never from a VLM judge. Tasks are procedurally
+generated with seedable distractor noise, so the corpus remains a moving
+target after release.
+
+### Headline (gemini-2.5-flash, single seed)
+
+| Class | n | API baseline | UI baseline | Δ |
+|---|---|---|---|---|
+| `api_only` | 19 | **15/19 = 79%** | 7/19 = 37% | API +42pp |
+| `ui_only` | 7 | 0/7 = **0%** | 3/7 = 43% | UI +43pp |
+| **Total** | **26** | **15/26 = 58%** | **10/26 = 38%** | API +20pp |
+
+The two zero cells are the paper-relevant story: `0%` API on `ui_only` is the
+platform-ceiling claim (the API surface contains no call sequence that mutates
+the verifier-checked state); `0` `only_ui` on `api_only` is the strict-API
+efficiency claim (when both can succeed, the API path always wins). Per-task
+contingency and reproduction commands are in
+[`api_baseline/results/RUNS.md`](api_baseline/results/RUNS.md).
 
 ---
 
-## Examples
+## See it run
 
-Two real episodes — Gemini 2.5 Flash driving the iOS Simulator end-to-end.
-Each was captured at real-time playback (3 fps); verification reads ground
-truth directly from the underlying data store.
+Gemini 2.5 Flash on the iOS Simulator, real-time playback (3 fps). Both
+episodes are unedited runs of the UI baseline; the second-row caption shows
+the verbatim instruction the agent received and the verifier outcome.
 
 <table>
 <tr>
@@ -31,39 +48,38 @@ truth directly from the underlying data store.
 <td><i>"Open Calendar. Create an event titled 'Date Night' tomorrow from 3pm to 3:45pm."</i></td>
 </tr>
 <tr>
-<td align="center"><sub>5 steps · verifier PASS (reads EventKit reminder store)</sub></td>
-<td align="center"><sub>16 steps · verifier PASS (reads EventKit calendar store)</sub></td>
+<td align="center"><sub>5 steps · verifier PASS</sub></td>
+<td align="center"><sub>16 steps · verifier PASS</sub></td>
 </tr>
 </table>
+
+These are two successful episodes from the headline run above. The UI
+baseline's full-corpus pass rate is 38% (10/26) — these gifs are not
+representative of typical behaviour.
 
 ---
 
 ## What's in the box
 
-- **Procedural task generators** across 11 system apps — Reminders, Calendar,
-  Contacts, Files, Photos, Health, Maps, Safari, Messages, Settings, Shortcuts
-- **Cross-app workflows** such as `Messages → Contacts → Maps` (parse an
-  address out of a message, save it to a contact's card, start navigation)
-- **Database-backed verifiers** that read state directly from EventKit, the
-  Reminders sqlite store, `Contacts.framework`, Maps' rstorage, the Files
-  sandbox, and PhotoKit. No VLM-as-judge.
-- **Persistent XCUITest server** built on Apple's first-party UI testing
-  framework — full iOS accessibility-tree access, ~200–400 ms per observation,
-  with `PINCH` / `DOUBLE_TAP` verbs for Maps / Photos and the Safari
-  auto-zoom recovery path
-- **Three baselines side-by-side** sharing the same task corpus and verifier
-  (see "Three baselines" below): a UI-driving agent (the original SIBB
-  scaffold), an API-only counterpart (Apple SDKs only — EventKit, Contacts,
-  MapKit, …), and a hybrid agent that picks action class per step
-- **Safari MockSite + harness-served `.test` hostnames** for reproducible
-  web-form / autofill tasks with no external network dependency
-- **Procedural task generation** with seedable randomized springboard layouts,
-  distractor records, and baseline noise
-- **Uniform LLM driver** with async clients for Anthropic, Google, and OpenAI;
-  the API baseline additionally uses native function-calling
-- **Tests** across a four-layer pyramid: pure-Python unit tests,
-  fake-reader integration tests, simulator-backed integration tests, and
-  Swift JSON-envelope contract tests
+- **77 procedural task generators** across the iOS-26.3 simulator's
+  installed apps — Reminders, Calendar, Contacts, Files, Maps, Safari,
+  Messages, Photos, Health, Settings, Shortcuts
+- **Cross-app workflows** like `Messages → Contacts → Maps` (parse the
+  address out of a message, save it to a contact, get directions)
+- **Database-backed verifier** with 13 named check kinds (`exists`,
+  `count`, `attribute_eq`, `attribute_set_contains`, `time_within`,
+  `geo_within_m`, `ordered_match`, …) that read directly from EventKit,
+  sqlite, `Contacts.framework`, Maps' rstorage, PhotoKit, and the Files
+  sandbox. No VLM-as-judge
+- **Three matched baselines** sharing one task corpus and one verifier:
+  UI driving (`benchmark/`), API-only via native function calling
+  (`api_baseline/`), and a Pattern-2 hybrid that picks per step
+  (`hybrid_baseline/`)
+- **Persistent XCUITest server** with full accessibility-tree access at
+  ~200–400 ms per observation, plus multi-touch verbs (`PINCH`,
+  `DOUBLE_TAP`) for Maps / Photos and the Safari auto-zoom recovery
+- **Safari MockSite + `*.test` DNS resolver** for reproducible web-form
+  tasks with no live-internet dependency
 
 ---
 
@@ -71,103 +87,128 @@ truth directly from the underlying data store.
 
 ### Prerequisites
 
-- macOS with Xcode 26.x (or newer) and the iOS Simulator installed
-- A booted iOS 26.x simulator — find its UDID with `xcrun simctl list devices`
-- Python 3.9+ (the project is tested against the system Python at
+- macOS with Xcode 26.3+ and the iOS 26.3 simulator runtime
+- Python 3.9 (the project pins the system Python at
   `/Library/Developer/CommandLineTools/usr/bin/python3`)
 
-### One-time setup
+```bash
+# Vendor SDKs — install only the providers you'll use
+python3 -m pip install --user anthropic google-generativeai openai
+
+# API key for the provider you'll use
+export GEMINI_API_KEY=...      # for --provider gemini   (default)
+export ANTHROPIC_API_KEY=...   # for --provider anthropic
+export OPENAI_API_KEY=...      # for --provider openai
+```
+
+### Create + boot the simulator
 
 ```bash
-export SIBB_UDID=<your-simulator-UDID>
+# Create a fresh iOS 26.3 simulator (one-time)
+export SIBB_UDID=$(xcrun simctl create "SIBB-Demo" "iPhone 17 Pro" \
+    "com.apple.CoreSimulator.SimRuntime.iOS-26-3")
+xcrun simctl boot "$SIBB_UDID"
 
-# Build the XCUITest server bundle (Apple's UI-testing framework; lives in
-# ~/SIBBHelper, outside this repo). Takes 1–2 minutes.
-cd simulator
-chmod +x sibb_xcuitest_setup.sh
+# Build the XCUITest server (lives at ~/SIBBHelper, outside this repo)
+cd sibb/simulator
+chmod +x sibb_xcuitest_setup.sh sibb_prewarm.sh
 ./sibb_xcuitest_setup.sh "$SIBB_UDID"
+
+# Prewarm — grant TCC, dismiss first-launch dialogs, settle the springboard
+./sibb_prewarm.sh "$SIBB_UDID"
 ```
+
+Full setup walkthrough (TCC dialogs, baseline cloning, MockSite DNS) is in
+[`docs/SIBB_RUNBOOK.md`](docs/SIBB_RUNBOOK.md).
+
+### Run an episode
+
+From the repo's parent directory (so the `sibb` package is importable):
+
+```bash
+# UI baseline — original SIBB scaffold (XCUITest + accessibility tree)
+python3 sibb/benchmark/sibb_assistant.py "$SIBB_UDID" \
+    --generator complete_specific_reminder \
+    --provider gemini --model gemini-2.5-flash --max-turns 15
+
+# API baseline — public Apple SDKs only (EventKit, Contacts, MapKit, …)
+python3 -m sibb.api_baseline.sibb_api_runner \
+    --udid "$SIBB_UDID" \
+    --provider gemini --model gemini-2.5-flash \
+    --task-filter complete_specific_reminder
+
+# Hybrid baseline — picks API vs UI per step
+python3 -m sibb.hybrid_baseline.sibb_hybrid_runner \
+    --udid "$SIBB_UDID" \
+    --provider gemini --model gemini-2.5-flash \
+    --task-filter complete_specific_reminder
+```
+
+To reproduce the headline table above, pass `--task-filter all` to either
+runner; see [`api_baseline/results/RUNS.md`](api_baseline/results/RUNS.md)
+for the exact commands and seeds used.
 
 ### Inspect what the agent sees
 
 ```bash
-cd benchmark
-python3 sibb_inspect_screen.py "$SIBB_UDID" --bundle com.apple.reminders
+python3 sibb/benchmark/sibb_inspect_screen.py "$SIBB_UDID" \
+    --bundle com.apple.reminders
 ```
 
-This dumps the accessibility tree the way the scaffold tokenizes it for the
-LLM — useful for sanity-checking what an agent is given on any iOS screen.
-
-### Generate a task and run it
-
-```bash
-# Procedurally generate a task corpus
-python3 sibb_task_generator_v3.py
-
-# Run an LLM-driven episode — UI baseline (the original SIBB scaffold).
-# Set your model's API key first.
-export GEMINI_API_KEY=...
-python3 sibb_assistant.py "$SIBB_UDID" \
-    --generator complete_specific_reminder \
-    --provider gemini --model gemini-2.5-flash \
-    --max-turns 15
-
-# Same task via the API-only counterpart (Apple SDKs only — Option A+).
-python3 ../api_baseline/sibb_api_assistant.py \
-    --udid "$SIBB_UDID" \
-    --task complete_specific_reminder \
-    --provider gemini --model gemini-2.5-flash
-
-# Or via the hybrid agent (picks API vs UI per step).
-python3 ../hybrid_baseline/sibb_hybrid_assistant.py \
-    --udid "$SIBB_UDID" \
-    --task complete_specific_reminder \
-    --provider gemini --model gemini-2.5-flash
-```
-
-The full setup walkthrough — TCC permissions, baseline cloning, prewarm
-quirks, Safari MockSite + `.test` DNS resolver, log paths — is in
-[`docs/SIBB_RUNBOOK.md`](docs/SIBB_RUNBOOK.md).
+Dumps the accessibility tree the way the scaffold tokenizes it for the
+LLM — useful for sanity-checking the observation on any iOS screen.
 
 ---
 
 ## Architecture
 
 ```
-                                       LLM driver
-                                  ┌──────────────────┐
-                                  │  sibb_assistant  │  Anthropic / Google / OpenAI
-                                  └────────┬─────────┘
-                                           │
-   Task generator                  Scaffold (AX bridge)              Verifier
-   ─────────────                   ─────────────────────              ────────
-   sibb_task_                      sibb_scaffold.py                   sibb_verify.py
-   generator_v3.py     ───►        AXReader → AXEnricher → ───►       reads EventKit,
-   72 generators                   AXTokenizer                        sqlite, plist,
-   procedural noise                ~200–400 ms / observation          rstorage, CN…
-                                           │
-                                           ▼
+                                     LLM driver
+                              ┌──────────────────────┐
+                              │  sibb_llm + assistant│  Anthropic / Gemini / OpenAI
+                              └──────────┬───────────┘
+                                         │
+   Task generator                Scaffold (AX bridge)              Verifier
+   ─────────────                 ─────────────────────              ────────
+   sibb_task_                    sibb_scaffold.py                   sibb_verify.py
+   generator_v3.py     ───►      AXReader → AXEnricher → ───►       reads EventKit,
+   77 generators                 AXTokenizer                        sqlite, plist,
+   procedural noise              ~200–400 ms / observation          rstorage, CN…
+                                         │
+                                         ▼
                           Swift XCUITest server (persistent)
                                 sibb_xcuitest_setup.sh
-                                       │
-                                       ▼
+                                         │
+                                         ▼
                               iOS Simulator (real apps)
 ```
 
 ### Why XCUITest
 
-XCUITest is Apple's first-party UI-testing framework — the same one Apple
-engineers use to test iOS itself. It exposes the full accessibility tree
-(`AXUIElement` hierarchy, focus state, labels, frames) and supports
-arbitrary tap / swipe / scroll synthesis. Unlike `idb` (Meta), which lost
-iOS 26 compatibility, XCUITest is always current with the iOS SDK.
+XCUITest is Apple's first-party UI testing framework. It exposes the full
+accessibility tree (`AXUIElement` hierarchy, focus, labels, frames) and
+synthesizes arbitrary tap / type / scroll / pinch / double-tap. Unlike
+`idb` (Meta), which lost iOS 26 compatibility in 2024, XCUITest tracks the
+current iOS SDK.
 
 ### Why database-level verification
 
 A verifier that reads ground-truth state from EventKit / sqlite / rstorage
 cannot be spoofed by an agent that "convinces" a VLM judge or whose final
-screen happens to look correct. Every SIBB verifier checks the underlying
-data store the app would persist to, not just the rendered UI.
+screen happens to look correct. SIBB's verifier ships 13 named check
+kinds (in `benchmark/sibb_verify.py`):
+
+```
+exists · absent · count · attribute_eq · attribute_set_contains
+attribute_list_length · subset · ordered_match · time_within
+geo_within_m · identity · relation · agent_terminal
+```
+
+`geo_within_m` is the one that distinguishes a verifier of *user-visible
+state* from a verifier of *what an agent claims it did*: a Maps task
+passes only if the active route's destination is within N metres of the
+expected coordinates, computed via haversine off the parsed rstorage
+plist. No screenshot, no VLM, no rendered UI involved.
 
 ---
 
@@ -177,26 +218,21 @@ data store the app would persist to, not just the rendered UI.
 sibb/
 ├── simulator/         XCUITest server, baseline prewarm, AX probes,
 │                        PINCH / DOUBLE_TAP verbs, zoom detection
-├── benchmark/         UI baseline — task generation, scaffold, verifier,
-│                        LLM driver, episode runner, Safari MockSite
-├── api_baseline/      API-only counterpart (Option A+) — Apple SDKs only;
-│                        empirical handle on the platform ceiling claim
-├── hybrid_baseline/   Pattern-2 hybrid agent — picks API or UI per step
+├── benchmark/         Task generator, scaffold, verifier, LLM driver,
+│                        episode runner, Safari MockSite + DNS shim,
+│                        and the UI-baseline assistant
+├── api_baseline/      API-only counterpart — Apple SDKs only, via
+│                        native function calling. Operational definition
+│                        of "API-doable" + 26-task scored slate
+├── hybrid_baseline/   Pattern-2 agent — picks API or UI per step
+│                        with asymmetric observations
 ├── scripts/           One-time host helpers (DNS resolver for *.test)
 ├── tests/             Four-layer test pyramid
-│                        └── unit/   integration/   e2e/   contract/
+│                        └── unit/   integration/   handler/   …
 └── docs/              Runbook, design notes, iOS quirks, app coverage
 ```
 
-A more detailed tour:
-
-- [`simulator/README.md`](simulator/README.md) — XCUITest server, simulator control
-- [`benchmark/README.md`](benchmark/README.md) — UI scaffold, task grammar, verifier
-- [`api_baseline/README.md`](api_baseline/README.md) — API-only baseline, per-task classification, operational definition
-- [`hybrid_baseline/PLAN.md`](hybrid_baseline/PLAN.md) — hybrid scaffold design (Pattern 2)
-- [`tests/README.md`](tests/README.md) — test pyramid, fake-reader fixtures
-
-### Three baselines
+### Three baselines, same verifier
 
 ```
                               ┌─────────────────┐
@@ -204,7 +240,7 @@ A more detailed tour:
                               │ (procedural,    │
                               │  seedable noise)│
                               └────────┬────────┘
-                                       │ same instruction, same pre-runner
+                                       │  same instruction, same pre-runner
                 ┌──────────────────────┼──────────────────────┐
                 ▼                      ▼                      ▼
         ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
@@ -227,11 +263,10 @@ A more detailed tour:
                           └────────────────────────┘
 ```
 
-All three are scored against the same database/file-level verifier. The UI
-scaffold is the original SIBB substrate; the API-only counterpart provides
-the per-task "could-be-done-without-UI" upper bound; the hybrid baseline
-measures what an agent picks when given both — currently the only one that
-has access to both kinds of action.
+All three baselines share the task corpus (the 77 generators in
+`sibb_task_generator_v3.py`), the pre-runner that establishes per-app
+baseline state, and the verifier. They differ only in the action
+substrate and the observation modality.
 
 ---
 
@@ -239,58 +274,91 @@ has access to both kinds of action.
 
 | Doc | Read it for |
 |---|---|
-| [`docs/SIBB_RUNBOOK.md`](docs/SIBB_RUNBOOK.md) | Complete setup, TCC, baseline cloning |
-| [`docs/IOS_SIM_QUIRKS.md`](docs/IOS_SIM_QUIRKS.md) | Quirks of `simctl` / iOS / TCC that surprised us |
+| [`docs/SIBB_RUNBOOK.md`](docs/SIBB_RUNBOOK.md) | Complete setup — TCC, sim creation, baseline cloning, MockSite DNS |
+| [`docs/IOS_SIM_QUIRKS.md`](docs/IOS_SIM_QUIRKS.md) | iOS / simctl / TCC behaviours that surprised us |
 | [`docs/APP_COVERAGE.md`](docs/APP_COVERAGE.md) | Which iOS apps SIBB covers and why |
 | [`docs/REAL_DEVICE_PORT.md`](docs/REAL_DEVICE_PORT.md) | Why this is simulator-only (real-device deployment investigation) |
 | [`docs/MAPS_VERIFICATION.md`](docs/MAPS_VERIFICATION.md) | How the Maps active-route verifier works |
 | [`docs/AGENT_TOOL_NOTES.md`](docs/AGENT_TOOL_NOTES.md) | Per-app notes on accessibility quirks |
 | [`docs/research_summary.md`](docs/research_summary.md) | Design rationale for SIBB |
-| [`api_baseline/README.md`](api_baseline/README.md) | Why an API counterpart exists and how it's scored |
+| [`api_baseline/README.md`](api_baseline/README.md) | Why an API counterpart exists, how it's scored |
 | [`api_baseline/operational_definition.md`](api_baseline/operational_definition.md) | Operational definition of "API-doable" with worked borderline examples |
-| [`hybrid_baseline/PLAN.md`](hybrid_baseline/PLAN.md) | Hybrid scaffold (Pattern 2) design |
+| [`api_baseline/results/RUNS.md`](api_baseline/results/RUNS.md) | Reproduction commands for the headline table |
+| [`hybrid_baseline/DESIGN.md`](hybrid_baseline/DESIGN.md) | Pattern-2 hybrid scaffold design |
+
+---
+
+## Limitations
+
+Honest disclosures a research user should know up front:
+
+- **Single seed, single model** in the headline table — `seed=0`,
+  `gemini-2.5-flash`. Multi-seed / multi-model runs are deferred to v2.
+- **Simulator-only.** All numbers are on the iOS 26.3 *simulator*, which
+  ships a narrower app set than a real device — Notes / Clock / Music /
+  Mail / Camera are unavailable in the runtime. Real-device deployment is
+  investigated in [`docs/REAL_DEVICE_PORT.md`](docs/REAL_DEVICE_PORT.md)
+  and is not in scope here.
+- **API/UI classification is theoretical** in v1 — grounded in cited
+  Apple primary sources rather than a measured rater agreement. A
+  Cohen's κ second-rater pass is planned for v2.
+- **The "0% by construction" claim** holds under the toolset the API
+  baseline currently exposes (cut C1 in
+  [`api_baseline/operational_definition.md`](api_baseline/operational_definition.md));
+  wider cuts (C2–C4) would change the bound, and the four-cut taxonomy is
+  spelled out in that doc.
+- **17 exploratory probe scripts** under `simulator/sibb_probe_*.py`
+  hard-code my own simulator UDID and need editing before they'll run on
+  yours. The main paths (assistant, scaffold, runners, tests) are all
+  portable and take UDID via command line / `SIBB_UDID`.
 
 ---
 
 ## Status
 
-This is research code. It is actively developed; interfaces will change;
-some scripts under `simulator/` are exploratory probes whose UDIDs are
-hard-coded for the original developer's setup and need to be adjusted
-before they will run on yours. The main paths — `sibb_assistant.py`,
-`sibb_scaffold.py`, the task generators, the test suite — read their
-simulator UDID from the `SIBB_UDID` environment variable and are portable.
+The main paths — `sibb_assistant.py`, `sibb_scaffold.py`, the task
+generators, the API and hybrid runners, the test suite — accept a
+simulator UDID by argument and run portably. The Swift
+`sibb_xcuitest_setup.sh` builds an Xcode project at `~/SIBBHelper/`
+that lives outside this repository and is regenerated whenever iOS /
+Xcode changes require it.
 
-The Swift `sibb_xcuitest_setup.sh` builds an Xcode project at
-`~/SIBBHelper/` — that directory lives outside this repository and is
-regenerated by the setup script when iOS / Xcode updates require it.
+This is research code under active development; interfaces will change.
+The 17 hardcoded-UDID probe scripts under `simulator/` flagged in
+*Limitations* above are diagnostic tooling — not part of the agent loop.
 
 ---
 
-## A note on related work
+## Related work
 
-SIBB is one of several iOS-agent evaluation efforts. UI-driving benchmarks on
-adjacent platforms include
-[AndroidWorld](https://github.com/google-research/android_world) (Android),
-[OSWorld](https://github.com/xlang-ai/OSWorld) (Linux/macOS/Windows desktop),
-and [WebArena](https://github.com/web-arena-x/webarena) (web). On iOS
-specifically, [UINavBench](https://openaccess.thecvf.com/content/ICCV2025/html/Agrawal_UINavBench_A_Framework_for_Comprehensive_Evaluation_of_Interactive_Digital_Agents_ICCV_2025_paper.html)
-(Apple, ICCV 2025) describes a 116-task benchmark on physical devices; as of
-this writing it has not been publicly released. [ShortcutsBench](https://arxiv.org/abs/2407.00132)
-(ICLR 2025) covers iOS API-call sequences without UI execution. SIBB
-differs by combining (a) the public iOS Simulator as the substrate, (b)
-database/file-level ground-truth verification, (c) procedural task
-generation, and (d) cross-app workflow tasks.
+The closest iOS-agent peers are
+[UINavBench](https://openaccess.thecvf.com/content/ICCV2025/html/Agrawal_UINavBench_A_Framework_for_Comprehensive_Evaluation_of_Interactive_Digital_Agents_ICCV_2025_paper.html)
+(Apple, ICCV 2025) and
+[ShortcutsBench](https://arxiv.org/abs/2407.00132) (ICLR 2025). SIBB
+differs from UINavBench on two axes that matter for reproducibility:
+SIBB uses the **public iOS Simulator** as the substrate (UINavBench's
+device fleet is unreleased), and SIBB verifies via **database-level
+state reads** rather than UINavBench's VLM judge. ShortcutsBench
+evaluates iOS *API-call sequences* offline (no UI execution); SIBB's
+API baseline is the live-execution counterpart, classified under a
+strictly tighter cut (C1) of "API-doable" than the Apple-Shortcuts
+chain that ShortcutsBench tests (C4 in our taxonomy).
+
+UI-driving benchmarks on adjacent platforms include
+[AndroidWorld](https://github.com/google-research/android_world)
+(Android), [OSWorld](https://github.com/xlang-ai/OSWorld) (desktop), and
+[WebArena](https://github.com/web-arena-x/webarena) (web).
 
 ---
 
 ## License
 
-[MIT](LICENSE) — use freely; please cite this repository if it helps
-your research.
+[MIT](LICENSE).
 
 ---
 
 ## Author
 
-Built by Maziar Sanjabi. Issues and pull requests welcome.
+Built by [Maziar Sanjabi](https://www.linkedin.com/in/maziar-sanjabi-3a40b423/)
+— ML researcher / engineer. Issues and pull requests welcome; if you're
+hiring, contact info is on the LinkedIn page above.

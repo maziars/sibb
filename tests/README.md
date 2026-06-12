@@ -2,7 +2,7 @@
 
 Four-layer test pyramid sized after a 2026-05-14 critic review. Full
 rationale + the multi-app episode lifecycle that L3 e2e tests cover
-lives in [`sibb/docs/PHASE2_PROGRESS.md`](../docs/PHASE2_PROGRESS.md)
+described in design notes
 under "Testing strategy."
 
 ## Layers

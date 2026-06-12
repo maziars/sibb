@@ -28,8 +28,7 @@ def test_can_import_fake_reader():
     from fakes.fake_reader import FakeXCUITestReader  # noqa: F401
 
 
-# Memory in CLAUDE.md / PHASE2_PROGRESS.md "Preserved" section: keep
-# the per-module __main__ smoke blocks; they're load-bearing for
+# # the per-module __main__ smoke blocks; they're load-bearing for
 # fast iteration. If a module drops the guard, this test catches it.
 _MODULES_WITH_MAIN = [
     "sibb/benchmark/sibb_state.py",

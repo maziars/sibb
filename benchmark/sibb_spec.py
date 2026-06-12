@@ -438,7 +438,7 @@ class RunShortcut(_SpecBase):
 
     Limitations (Apple constraints, not ours):
       - Cannot create / edit / delete shortcuts. Apple has no public
-        API; the Core Data store is opaque. See TODO_DEFERRED §G1.
+        API; the Core Data store is opaque..
       - Cannot run trigger-based Automations by name. URL scheme is
         name-addressable for Library shortcuts only. Automations
         need UI drive: open Automation tab → tap automation →

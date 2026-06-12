@@ -1,8 +1,7 @@
 """Day-1 invariants for sibb/api_baseline/classification.yaml.
 
 These tests pin the foundation decisions made during the 5-reviewer Bucket-A
-pass (see memory/sibb_consolidated_findings_engineering_plan_2026-06-09.md
-Part 3 and the Bucket-A response in the conversation transcript). If any of
+pass . If any of
 these fail, the upcoming code in sibb/api_baseline/sibb_api_tools.py and
 sibb_api_runner.py will silently misbehave — either the runner will try to
 load a generator that doesn't exist, the dispatcher will route to a Swift

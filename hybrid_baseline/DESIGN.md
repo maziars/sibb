@@ -10,7 +10,7 @@ slate, same seed, same model. Reports per-step `action_type` distribution
 (the iOS analog of GUI-360°'s 81/19 split).
 
 **Why Pattern 2 over Pattern 5 (Code-as-Action)** — see PLAN context
-in `memory/sibb_paper_hybrid_scaffold_landscape_2026-06-09.md`. Short
+in the design notes. Short
 version: production convergence (MobileWorld/MCPWorld/GUI-360°/ChatGPT
 Agent), empirical data favors explicit per-step modality choice,
 preserves the JSONL `action_type` measurement, lower complexity for
@@ -32,16 +32,6 @@ Cohen's κ failure-mode attribution.
 | Two valid actions same turn | First valid wins; second logged `ignored_multi_action` (mirrors UI scaffold's existing rule, task #262) |
 
 ---
-
-## Phase 0 — Pre-build (no code, ~0.5 day)
-
-- [ ] Land this PLAN.md in `sibb/hybrid_baseline/` for review
-- [ ] Update memory: write a new memo locking Pattern 2 over Pattern 5
-      with the empirical-data justification (anti-correlated API call
-      count, 0% API on ui_only, 43% UI on ui_only — hybrid needs explicit
-      modality choice not hidden in code)
-- [ ] Decide: agent.fail vs agent.answer-with-failure-payload (FAIL
-      "reason" → `agent.fail(reason)` is cleanest; route both)
 
 ## Phase 1 — System prompt + dispatcher (~1.5 days)
 
@@ -195,16 +185,14 @@ Sim-test on 3 representative tasks before the full slate:
 
 ## Phase 5 — Full 26-task run + comparison + commit (~1 day)
 
-- [ ] Boot sim, run all 26 tasks via hybrid runner
-- [ ] Stitch into `headline_hybrid_v1_26tasks.json`
-- [ ] Extend `headline_comparison_v5_26tasks.json` to be three-way
+
       (API / UI / Hybrid)
-- [ ] Update `RUNS.md` with the three-baseline comparison +
+
       action-split statistic
-- [ ] Add per-task table to `analyze_difficulty_vs_success.py`:
+
       "Hybrid pass" column + correlation analysis on whichever
       difficulty estimate (UI or API) the agent actually used per turn
-- [ ] Commit + push
+
 
 ---
 

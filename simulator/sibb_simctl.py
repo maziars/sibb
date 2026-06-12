@@ -202,8 +202,7 @@ async def restart_springboard(udid: str, settle: float = 2.0) -> None:
 
     Mechanism: `launchctl kickstart -k` SIGKILLs SpringBoard and lets
     launchd respawn it. On respawn it re-reads TCC.db fresh. Empirically
-    proven via wix/AppleSimulatorUtils (used by Detox) — search
-    references in `sibb/docs/TODO_DEFERRED.md` B3.
+    proven via wix/AppleSimulatorUtils (used by Detox) — search.
 
     Idempotent — safe to call on a booted sim at any point. Takes
     ~2-3s end-to-end (SIGKILL + respawn + the settle wait below).

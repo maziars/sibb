@@ -34,7 +34,7 @@ gaps. Audit done 2026-05-16 against iOS 26.3 simulator.
 | Photos        | A | ✅ installed                | ✅ onboarded     | — | — |
 | Health        | A | ✅ installed (sim-limited)  | scaffolded (L1+L1.5 pass; L2 skipped — see IOS_SIM_QUIRKS §10) | — | — |
 | Maps          | A | ✅ installed                | ✅ minimal (no inject; v1 = bundle_id + location TCC only) | — | — |
-| Shortcuts     | A | ✅ installed                | ✅ minimal handler — `apply(type="run", name, input)` via `shortcuts://run-shortcut?...` URL scheme; `shortcuts.installed` AX-read fetcher. No create/edit/delete (Apple-API gap); no run-by-name for Automations (use UI "Run Immediately"). See TODO_DEFERRED §G1 for rationale.    | — | — |
+| Shortcuts     | A | ✅ installed                | ✅ minimal handler — `apply(type="run", name, input)` via `shortcuts://run-shortcut?...` URL scheme; `shortcuts.installed` AX-read fetcher. No create/edit/delete (Apple-API gap); no run-by-name for Automations (use UI "Run Immediately").    | — | — |
 | **Notes**     | A | ❌ gutted stub              | gap              | [Simplenote](https://github.com/Automattic/simplenote-ios) | — |
 | **Clock**     | A | ❌ gutted stub              | gap              | none found       | yes (~½ day) |
 | **Mail**      | A | ❌ gutted stub              | gap              | [ProtonMail iOS](https://github.com/ProtonMail/ios-mail) | — |

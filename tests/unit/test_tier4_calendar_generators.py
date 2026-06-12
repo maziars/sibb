@@ -454,7 +454,7 @@ def test_url_field_round_trips_through_fake():
     matches the input. Mirror the contract the Swift round-trip
     promises (C5 added strict parse-failure handling on the Swift
     side; the fake doesn't reject malformed URLs — that's a known
-    gap, see TODO_DEFERRED if it surfaces in L2)."""
+    gap)."""
     reader = FakeXCUITestReader()
     url = "https://example.com/path?key=value"
     asyncio.run(reader._send({

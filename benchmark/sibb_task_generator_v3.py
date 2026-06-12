@@ -662,7 +662,6 @@ def noise_contacts(target_name, n=3) -> List[NoiseRecord]:
     return records
 
 
-
 def noise_layout(seed: int = None,
                  cross_page: bool = False,
                  distribute: Optional[bool] = None,
@@ -793,7 +792,6 @@ def verify_partial_feasibility(doable: list, blocked: list) -> str:
             f"NEGATIVE checks (all must be absent in diff): {neg}. "
             f"Agent log must contain FAIL action. "
             f"Binary: 1.0 only if ALL positive pass AND ALL negative absent AND FAIL present.")
-
 
 
 def gen_clock_alarm(detail_level=None):
@@ -4408,7 +4406,6 @@ def _pick_distinct_contact_names(n: int) -> List[Tuple[str, str]]:
     return list(pairs)
 
 
-
 # Scalar Contacts fields that the Swift `list_contacts` row OMITS when
 # empty (sparse emission, mirrors list_reminders convention). `r.get(attr)`
 # returns None for these when absent; an attribute_eq check with value=""
@@ -6813,7 +6810,7 @@ def gen_create_recurring_event():
 #     dedup vs UI's expanded-occurrence view would mismatch.
 #   • Human-demo deferred to LLM trial per Reminders T5 precedent.
 #   • Episode-time pinning ships with same-day fragility (same as
-#     Reminders T5); documented in TODO_DEFERRED §H.
+#     Reminders T5).
 
 
 # ── T5.1 — lookup_event_location ─────────────────────────────────────────────
@@ -6924,8 +6921,7 @@ def gen_lookup_event_location():
 #
 # Episode-time fragility: "today" is computed at task-generation time,
 # events seeded relative to that. If the episode straddles midnight,
-# the agent's "today" may differ. Documented in TODO_DEFERRED §H per
-# Reminders T5 precedent.
+# the agent's "today" may differ..
 
 def gen_list_events_today():
     """Report the titles of all events on today's date. Excludes
@@ -10111,7 +10107,6 @@ def gen_safari_shop_pick_by_attrs():
           Q2 (named-product): instruction names a short search hint
               the agent types verbatim.
       * Q3 (URL-anchored) and Q4 (filter+sort cascade) deferred —
-        see `TODO_DEFERRED.md` §H7-shop and the dedicated
         `gen_safari_shop_filter_and_sort` generator.
     """
     site_id = f"shop-{uuid.uuid4().hex[:8]}"

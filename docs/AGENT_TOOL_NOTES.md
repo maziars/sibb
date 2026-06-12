@@ -211,7 +211,7 @@ the next observation reflects the post-transition state.
   without ever entering an observation. The loop is strict observe →
   act → observe; nothing happens in the background. (Locked in by
   `CLAUDE.md` → Key Design Decisions; full ramifications in
-  `PHASE1_PROGRESS.md` → Design assumptions.)
+  design notes → Design assumptions.)
 - **Mid-animation snapshots.** The first observation right after an
   action that triggers a transition may show 0 or very few elements.
   The next observation (or a small wait + observe again) catches up.

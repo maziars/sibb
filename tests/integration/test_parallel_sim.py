@@ -29,7 +29,7 @@ import pytest
 # serialization across workers) closed the TCC race that had been
 # making this test ~50% flaky under concurrency=2. Empirical proof:
 # 5-of-5 consecutive runs PASSED with the full fix stack. See
-# TODO_DEFERRED.md B3 (now RESOLVED) for the investigation trail.
+#
 pytestmark = pytest.mark.sim
 
 
@@ -93,7 +93,7 @@ async def test_parallel_with_mixed_outcomes(sibb_udid: str):
     Why one combined test instead of two separate ones: running
     two `run_episodes_parallel` invocations back-to-back stresses
     simctl/tccd state in a way that surfaces the deferred TCC
-    dialog race (TODO_DEFERRED.md B3). Consolidating lets the L2
+    dialog race Consolidating lets the L2
     suite cover parallelism + isolation without compounding that
     pre-existing flake. The TCC race is reproducible and tracked;
     it's separate from D1b's orchestrator correctness.

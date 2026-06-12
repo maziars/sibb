@@ -76,7 +76,7 @@ async def test_calendar_state_is_empty_after_apply():
 async def test_verifier_before_fails_calendar_check():
     # Before the agent acts, Reminders-side checks pass but the
     # Calendar event check fails — exactly the "pre_completed"
-    # guard PHASE2_PROGRESS.md describes.
+    #.
     import sibb_verify
     task = _resolved_task(seed=42)
     reader = FakeXCUITestReader()

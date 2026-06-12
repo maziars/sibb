@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use SIBB in your research, please cite it as below."
+title: "SIBB — Smartphone Interaction Benchmark for Bots"
+authors:
+  - family-names: Sanjabi
+    given-names: Maziar
+repository-code: "https://github.com/maziars/sibb"
+license: MIT
+date-released: 2026-06-02
+type: software

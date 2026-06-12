@@ -2337,7 +2337,7 @@ class SpringboardHandler:
 # v1 NON-capabilities (Apple constraints, not ours):
 #   - No create / edit / delete. Apple has no public API for these;
 #     the Shortcuts Core Data store is opaque, located in a Group
-#     container we haven't reverse-engineered. See TODO_DEFERRED §G1
+#     container we haven't reverse-engineered.
 #     for the full design rationale.
 #   - No run-by-name for trigger-based Automations. URL scheme is
 #     name-addressable for Library shortcuts only. Automations need
@@ -2459,7 +2459,7 @@ class ShortcutsHandler:
     shortcut via the `shortcuts://run-shortcut` URL scheme. The
     `shortcuts.installed` resource fetcher reads the Library tab via
     AX. No create / edit / delete — Apple doesn't expose APIs for
-    those (TODO_DEFERRED §G1).
+    those.
 
     Side-effect verification is the primary path: the shortcut's
     actions write to Reminders / Files / etc.; read those back via
@@ -2489,10 +2489,9 @@ class ShortcutsHandler:
             raise ValueError(
                 f"ShortcutsHandler: type={kind!r} not supported in v1. "
                 f"Apple has no public API to create/edit/delete user "
-                f"shortcuts — the Core Data store is opaque (see "
-                f"TODO_DEFERRED §G1). Build shortcuts manually in the "
-                f"Shortcuts UI during episode setup if pre-seeded ones "
-                f"are needed.")
+                f"shortcuts — the Core Data store is opaque. Build "
+                f"shortcuts manually in the Shortcuts UI during episode "
+                f"setup if pre-seeded ones are needed.")
         elif kind == "run_automation":
             raise ValueError(
                 f"ShortcutsHandler: type='run_automation' not supported "
@@ -2915,7 +2914,7 @@ async def apply_initial_state(reader, task) -> Dict[str, Any]:
     # interleaved apps and made cross-app dependency ordering invisible.
     # Per-app pipelines honor `depends_on` and isolate failure modes
     # (e.g. CalendarAgent shared-daemon races between Reminders and
-    # Calendar reset — see PHASE2_PROGRESS.md "Multi-app episode lifecycle").
+    # Calendar reset —).
     for bid in ordered:
         cls = HANDLERS.get(bid)
         if cls is None:

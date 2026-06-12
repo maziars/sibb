@@ -16,7 +16,7 @@ intents (Scaffidi/Shaw/Myers 2005), production-agent convergence on UI
 driving (every frontier lab independently chose UI), and the transparency
 / graduated-autonomy framing of WorkArena (Drouin et al. 2024). For the
 durable framing in full, see
-`memory/sibb_paper_motivation_synthesis_2026-05-31.md`.
+
 
 What this directory adds is a single empirical handle on one consequence of
 those arguments: that for *some* iOS tasks, the platform's currently-exposed
@@ -61,8 +61,6 @@ sibb/api_baseline/
 ├── sibb_api_assistant.py       ← agent loop (fork of Anthropic loop.py)
 ├── sibb_api_runner.py          ← experiment driver over the 26-task slate
 ├── stitch_results.py           ← merge results.json files across runs
-├── sibb_api_second_rater.py    ← Cohen's κ on the classification labels
-├── sibb_api_code_act.py        ← code-act ablation (5 tasks)
 └── results/                    ← gitignored; timestamped run dirs
 ```
 
@@ -82,7 +80,7 @@ Six guarantees so this directory never collides with active UI work:
    directory — except the planned `sibb_llm.py` extension (~290 → ~520
    LOC) for cross-scaffold operational gains and provider translators.
    That extension is owned by the separate `sibb_llm.py` work item in
-   `memory/sibb_consolidated_findings_engineering_plan_2026-06-09.md`
+   
    Part 5 and is scheduled to land *before* the API agent depends on it.
 2. **No edits** to `SIBBServer.swift` or `sibb_xcuitest_setup.sh`. We use
    the 11 *existing* Swift handlers as-is.
@@ -156,7 +154,7 @@ code-as-action wrapper).
 | Trajectory log      | Polymorphic JSONL with `type`-tagged records matching the UI baseline's vocabulary (`task`, `initial_state`, `verify_before`, `turn`, `action`, `verify_after`, `truncated`, `exhausted`, `llm_error`, `abort`) plus one new `tool_call` record type. `agent.answer` payload routes through the same `context["agent_answer"]` slot the UI baseline uses, so `verify_via(...)` sees a single shape regardless of baseline. |
 
 Rationales for each choice live in the project memory under
-`memory/sibb_consolidated_findings_engineering_plan_2026-06-09.md`.
+
 
 ## Where the data comes from
 
@@ -176,37 +174,6 @@ Rationales for each choice live in the project memory under
 
 ## How to run
 
-```bash
-# Smoke (3 tasks: 1 Reminders, 1 Calendar, 1 Contacts), v1 model only
-/Library/Developer/CommandLineTools/usr/bin/python3 \
-    -m sibb.api_baseline.sibb_api_runner \
-    --udid $SIBB_UDID \
-    --provider gemini --model gemini-2.5-flash \
-    --smoke
-
-# Full v1 run (26 tasks × gemini-2.5-flash × 1 seed)
-/Library/Developer/CommandLineTools/usr/bin/python3 \
-    -m sibb.api_baseline.sibb_api_runner \
-    --udid $SIBB_UDID \
-    --provider gemini --model gemini-2.5-flash \
-    --seeds 0 \
-    --results-dir sibb/api_baseline/results
-
-# Cohen's κ second-rater pass — runs against pinned operational_definition.md
-/Library/Developer/CommandLineTools/usr/bin/python3 \
-    -m sibb.api_baseline.sibb_api_second_rater \
-    --raters gemini-2.5-pro,claude-opus-4-7 \
-    --rubric-commit HEAD
-
-# Stitch results across multiple runs into a single headline artifact
-/Library/Developer/CommandLineTools/usr/bin/python3 \
-    -m sibb.api_baseline.stitch_results \
-    --runs sibb/api_baseline/results/run_<ts1> \
-           sibb/api_baseline/results/run_<ts2> \
-    --out  sibb/api_baseline/results/headline_<label>.json \
-    --description "Stitched headline (mid-run crash recovery)"
-```
-
 Module-form invocation requires `sibb/__init__.py` and
 `sibb/api_baseline/__init__.py` (both shipped). Results land under
 `results/run_<ts>/`:
@@ -221,29 +188,20 @@ Module-form invocation requires `sibb/__init__.py` and
 * No new Swift handlers — we work with the 11 existing ones.
 * No edits to `sibb/benchmark/` for any purpose except the planned
   `sibb_llm.py` extension (operational + translator layer).
-* No hybrid agent (that's v2 — Approach C in
-  `memory/sibb_paper_hybrid_scaffold_landscape_2026-06-09.md`).
+* No hybrid agent (that's the sibling `hybrid_baseline/` directory).
 * No multi-model evaluation in v1 (gemini-2.5-flash only).
 * No multi-seed runs in v1 (n=26 is the bottleneck; multi-seed control is v2).
 * No failure-mode tagger over trajectories (deferred to v2).
 * No prompt-ablation arm (v2; v1 reports raw pass rate with `<TOOLS>`-style
   prompt).
-* No UI baseline run (assumed running in parallel under `sibb/benchmark/`).
 
 ## Pointers
 
-* **Engineering plan**:
-  `memory/sibb_paper_option_a_plus_plan_2026-05-31.md`
-* **Locked decisions across UI / API / Hybrid scaffolds**:
-  `memory/sibb_consolidated_findings_engineering_plan_2026-06-09.md`
-* **Durable paper motivation** (lead-with-this framing):
-  `memory/sibb_paper_motivation_synthesis_2026-05-31.md`
-* **Scaffold protocol decisions** (native FC, tool search, etc.):
-  `memory/sibb_paper_scaffold_design_synthesis_2026-06-09.md`
-* **Why not LiteLLM / Pydantic AI**:
-  `memory/sibb_paper_llm_abstraction_decision_2026-06-09.md`,
-  `memory/sibb_paper_pydantic_ai_evaluation_2026-06-09.md`
 * **Operational definition (4 cuts + worked examples)**:
   [`operational_definition.md`](operational_definition.md)
 * **Per-task classification**:
   [`classification.yaml`](classification.yaml)
+* **Headline numbers + reproduction commands**:
+  [`results/RUNS.md`](results/RUNS.md)
+* **Hybrid scaffold (sibling directory)**:
+  [`../hybrid_baseline/DESIGN.md`](../hybrid_baseline/DESIGN.md)

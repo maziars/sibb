@@ -6,8 +6,7 @@ v1 ships:
   - `shortcuts.installed` resource fetcher — AX read of the Library
     tab cell labels, parsed by `_parse_shortcuts_library_tree`
 
-v1 does NOT ship (Apple-side constraints, captured in
-TODO_DEFERRED §G1):
+v1 does NOT ship (Apple-side constraints):
   - create / edit / delete shortcuts (no public API)
   - run-by-name for trigger-based Automations (URL scheme is
     Library-only)
@@ -212,12 +211,11 @@ async def test_apply_unknown_kind_raises():
 
 
 @pytest.mark.parametrize("kind", ["create", "edit", "delete"])
-async def test_apply_create_edit_delete_raise_with_pointer_to_g1(kind):
-    """The error message must mention the Apple-API limitation +
-    TODO_DEFERRED §G1 so a future engineer doesn't think this is
-    just unimplemented."""
+async def test_apply_create_edit_delete_raise_with_explanation(kind):
+    """The error message must explain the Apple-API limitation so a
+    future engineer doesn't think this is just unimplemented."""
     h = ShortcutsHandler(reader=_UdidStub())
-    with pytest.raises(ValueError, match=r"TODO_DEFERRED.*G1"):
+    with pytest.raises(ValueError, match=r"no public API to create/edit/delete"):
         await h.apply({"type": kind})
 
 

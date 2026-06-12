@@ -96,7 +96,7 @@ Format:
   natural cache-refresh cadence is slower than the runner's first
   framework call.
 - **Workaround**: three layers in
-  [`TODO_DEFERRED.md` B3](TODO_DEFERRED.md): (a) `launchctl
+  (a) `launchctl
   kickstart -k system/com.apple.SpringBoard` after every TCC grant
   (`sibb_simctl.restart_springboard`), (b) Swift-side retry loop
   in `acquireReminderStore` / `acquireEventStore` /
@@ -125,10 +125,7 @@ Format:
   `requestAccess(to: .reminder)` path which only needs
   `NSRemindersUsageDescription` (which IS auto-injected).
 - **Revisit on**: Apple deprecating the legacy `requestAccess`
-  path (currently still works on iOS 26). [`TODO_DEFERRED.md`
-  E1](TODO_DEFERRED.md) tracks the deprecation runway.
-
----
+  path (currently still works on iOS 26). ---
 
 ## 6. In-app onboarding flows aren't plist-suppressible
 
@@ -1807,7 +1804,7 @@ When a new iOS / Xcode version surfaces a quirk:
 1. Add a section here with the format above.
 2. Cite the commit that introduced the workaround.
 3. If it's a TCC / permission quirk, also cross-link from
-   [`TODO_DEFERRED.md`](TODO_DEFERRED.md) section B.
+   the runbook section B.
 4. If it's an iOS-version-deprecation quirk (will eventually need
-   replacement), open a section E entry in `TODO_DEFERRED.md`
+   replacement), raise an issue
    with the deprecation runway.

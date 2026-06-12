@@ -43,7 +43,7 @@ el.label          # "Title" — accessibility label
 el.effective_label # label after enrichment (may differ if enriched)
 el.value          # "Hello" — current field value
 el.enabled        # True/False
-el.focused        # True if keyboard focus (PENDING — not working yet)
+el.focused           # True if keyboard focus
 el.frame          # AXFrame(x, y, width, height)
 el.frame.center_x # tap coordinate x
 el.frame.center_y # tap coordinate y

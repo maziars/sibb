@@ -2,7 +2,7 @@
 
 This document gives a precise, falsifiable definition of when a SIBB task is
 *API-doable* on iOS. It is the rubric the second-rater
-(`sibb_api_second_rater.py`) applies when reproducing the labels in
+(planned for v2) applies when reproducing the labels in
 `classification.yaml`, and it is the methodological commitment the paper
 makes.
 
@@ -313,7 +313,7 @@ gates the runner against silent-pass regressions.
 
 ## §C. Process for the second-rater
 
-`sibb_api_second_rater.py` runs two LLM raters (Gemini 2.5 Pro and Claude
+A planned (v2) second-rater pipeline will run two LLM raters (Gemini 2.5 Pro and Claude
 Opus 4.7) on the 29 scored tasks + 2 hybrid extras (31-task κ target). Each
 rater sees:
 

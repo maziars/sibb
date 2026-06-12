@@ -64,7 +64,7 @@ Python 3.9-targeted code.
 Layered run instructions live in
 [`../tests/README.md`](../tests/README.md). Test-layer rationale
 (why L1 / L1.5 / L2 / L3 / L4) is in
-[`PHASE2_PROGRESS.md`](./PHASE2_PROGRESS.md) → "Testing strategy".
+"Testing strategy".
 
 ---
 
