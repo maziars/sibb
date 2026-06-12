@@ -359,6 +359,5 @@ UI-driving benchmarks on adjacent platforms include
 
 ## Author
 
-Built by [Maziar Sanjabi](https://www.linkedin.com/in/maziar-sanjabi-3a40b423/)
-— ML researcher / engineer. Issues and pull requests welcome; if you're
-hiring, contact info is on the LinkedIn page above.
+Built by [Maziar Sanjabi](https://www.linkedin.com/in/maziar-sanjabi/)
+— Principal Scientist. Issues and pull requests welcome.
