@@ -360,4 +360,4 @@ UI-driving benchmarks on adjacent platforms include
 ## Author
 
 Built by [Maziar Sanjabi](https://www.linkedin.com/in/maziar-sanjabi/)
-— Principal Scientist. Issues and pull requests welcome.
+— AI Scientist. Issues and pull requests welcome.
